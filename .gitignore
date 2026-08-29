@@ -1,0 +1,25 @@
+# data
+data/raw/
+data/processed/
+*.csv
+*.csv.gz
+*.jsonl
+*.jsonl.gz
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# notebooks
+.ipynb_checkpoints/
+
+# jax/checkpoints
+checkpoints/
+*.ckpt
+*.orbax-checkpoint/
+
+# os
+.DS_Store
+Thumbs.db
