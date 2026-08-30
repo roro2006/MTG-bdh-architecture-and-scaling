@@ -20,7 +20,9 @@ Splits are drawn on `draft_id`, not on individual rows. All ~45 picks belonging 
 
 Single-set `draft_data_public.<SET>.PremierDraft.csv.gz` from 17lands, vocabulary built from its `pack_card_*` columns. See `DATA.md` for what's been verified about this source directly, including actual file sizes pulled from the bucket rather than taken from documentation.
 
-Before the train/val/test split is drawn, a separate subset is carved out: states where the same pack-and-pool combination recurs across different drafts and different players. This subset is never trained on — it exists solely to measure how often two people facing the same decision disagree, which is the input to the Bayes-floor check in §6.
+Before the train/val/test split is drawn, a separate subset is carved out: states where the same pack-and-pool combination recurs across different drafts and different players. This subset is never trained on — it exists solely to measure how often two people facing the same decision disagree, which is the input to the Bayes-floor check in §6. (What "the same state" means is now an open question rather than a settled one — see §6a.)
+
+Exclusion is at *draft* granularity, not row granularity. Dropping only the matched row would leave that row's label sitting inside the pool of the very next pick of the same draft, which is in training — the answer would leak through the pool even though the row itself was withheld. `split_by_draft` supports row-level exclusion as an escape hatch if draft-level turns out to cost too much of the corpus, and using it would have to be declared.
 
 ## 3. Architecture
 
@@ -46,6 +48,22 @@ For every recurring pack/pool state in the held-out matched-state subset, comput
 
 The interesting result isn't just "the fitted $E$ matches the floor." A mismatch is worth reporting too, and worth being direct about in the writeup rather than glossing over — if $E$ comes in below the measured floor, that's a sign the model (or the split) is leaking something it shouldn't have access to, not a sign the architecture beat human unpredictability.
 
+### 6a. Measured: exact state matching does not work, and the obvious relaxation is a trap
+
+This was checked against real FIN data (16,212 picks, 386 drafts) as soon as the ingest pipeline could produce it, rather than being left as a stage-6 discovery. Two findings, both load-bearing:
+
+**Exact `(pack, pool, pack_number, pick_number)` matching yields zero recurring states.** Not "few" — zero. The reason is structural rather than a sample-size artifact: the pool is a near-unique fingerprint almost immediately. By pack 0 pick 2, when the pool holds just *two* cards, 380 of 386 pools are already distinct; from pool size 12 onward every pool in the sample is unique. Since pool size is fully determined by `pack_number` and `pick_number`, an exact match needs a pool collision, and pools stop colliding almost at once. Scaling to the full ~5.8M-pick corpus does not fix this — it is a statement about how fast the state space opens up, not about how many samples were drawn.
+
+**Dropping the pool from the state key — the natural first relaxation — concentrates all the recurrence on decisions that aren't decisions.** Matching on `(pack, pack_number, pick_number)` alone does find recurrence, 7.4% of rows. But 100% of those rows sit at picks 11–13, and 91.4% at pick 13, where the pack contains exactly one card and the loss is identically zero. Packs collide there for the trivial reason that a 1-card pack has only 363 possible values. A floor measured over that subset would be measured almost entirely over forced non-choices, and would come back near zero — an apparently clean number that means nothing, and would make any fitted $E$ look badly miscalibrated for reasons that have nothing to do with the models.
+
+So the fallback named in §8 is not a contingency any more; it is the primary path, and it needs to be a relaxation that stays in the part of the draft where a real decision exists (roughly picks 0–8, where the pack still holds six or more cards). The relaxation has to be *chosen and justified*, not defaulted into. The candidates worth weighing:
+
+- **Coarsen the pool, keep the pack exact.** Condition on a summary of the pool — its color distribution, curve, creature/spell split — rather than its exact contents. Two drafters with the same pack and a similarly-shaped pool are facing substantially the same decision, which is the thing the floor is supposed to measure.
+- **Drop to pairwise preference.** For each card pair $(A, B)$ that co-occurs in a pack, measure how often $A$ is taken over $B$, conditioned on a coarse pool descriptor. Sample sizes become large, but it measures a different quantity than per-state entropy and the writeup would have to say so plainly.
+- **Restrict to early picks and accept a smaller subset.** Keeps the exact-match discipline; may simply not yield enough states to be stable.
+
+Whichever is chosen, the relaxation gets stated in the writeup as a first-class methodological decision with this measurement attached, not as a footnote.
+
 ## 7. Deliverables
 
 - `src/data/` — the ingestion and vocabulary pipeline.
@@ -58,7 +76,7 @@ The interesting result isn't just "the fitted $E$ matches the floor." A mismatch
 - **BDH instability.** Addressed above, but worth repeating: this is not a battle-tested architecture, and the porting stage should be budgeted like a research task, not a translation exercise.
 - **Iso-parameter vs. iso-compute.** Reporting only one of them makes the headline claim ambiguous. Both get reported, always.
 - **Grid compute budget.** 80 runs is the target; cut seeds before cutting grid coverage if time runs short.
-- **Thin matched-state subset.** If exact-match recurring states turn out to be too rare to measure a stable floor from, the fallback is a defined near-match distance threshold — and that relaxation gets stated explicitly in the writeup, not buried in a footnote.
+- **Thin matched-state subset — now measured, and worse than "thin".** Exact-match recurring states do not merely turn out to be rare; on real FIN data there are *none*, and the obvious relaxation puts 100% of its recurrence on picks 11–13 where the pack holds three cards or fewer. See §6a for the numbers and the candidate relaxations. This is the open methodological question in the project, and it is worth settling before the grid consumes real compute, because the floor comparison is half of what makes the study more than a curve fit.
 
 ## 9. Build order
 

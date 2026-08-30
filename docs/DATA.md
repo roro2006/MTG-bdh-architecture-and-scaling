@@ -11,6 +11,35 @@ This is a survey of what's actually reachable, checked against the live endpoint
 
 This is the right backbone for the scaling study specifically because it's simultaneously **closed-vocabulary** (one set's card pool, a few hundred cards) and **high-volume** (drafted through the official client by a large player base), which is what a $D$-sweep across multiple orders of magnitude actually needs. Long-standing open dataset in the MTG analytics community; worth a personal glance at their terms page before publishing anything derived from it, but there's no real ambiguity in practice here.
 
+### The set actually being used: FIN.PremierDraft
+
+`FIN` (Final Fantasy) is the set the scaling grid runs on. Its export is 215,700,130 bytes compressed. Bucket-wide listing returns `AccessDenied`, so files were confirmed by direct `HEAD` — thirteen sets checked, all live, sizes from 141MB (`EOE`) to 304MB (`OTJ`).
+
+Structure was verified by range-fetching and decompressing the first 600KB rather than trusting the format description:
+
+- **740 columns**: 14 metadata + 363 `pack_card_<name>` + 363 `pool_<name>`. The card count *is* the vocabulary size.
+- Metadata is `expansion, event_type, draft_id, draft_time, rank, event_match_wins, event_match_losses, pack_number, pick_number, pick, pick_maindeck_rate, pick_sideboard_in_rate, user_n_games_bucket, user_game_win_rate_bucket`.
+- `pick` is a card **name**, not an id.
+- `pack_card_*` values are **counts, not flags**. FIN's sample is all 0/1, but `OTJ` contains packs with a card at count 2 — a boolean parse would silently drop them.
+- Packs hold **14** selectable cards, not 15, and 42 picks make a draft (3 x 14).
+- Card names contain commas (`pack_card_Zidane, Tantalus Thief`), so the header needs a real CSV parser; a `split(",")` shreds 41 of OTJ's 381 columns.
+
+Extrapolating the observed 42.5x compression ratio puts the full file at roughly **9.2GB uncompressed, ~5.8M picks across ~139k drafts**. That does not fit in memory as a dataframe, which is what `src/data/ingest.py` exists to deal with.
+
+### The pool columns are redundant, and dropping them is what makes this fit
+
+The 363 `pool_*` columns carry no information the pick history doesn't already have: the pool at any pick is exactly the set of that draft's earlier picks. Verified on the sample — `|pool| == pack_number * 14 + pick_number` holds on every row checked, and pools reconstructed from the pick prefix match the raw `pool_*` columns exactly on 400 randomly drawn rows.
+
+So ingest reads neither, and stores packs as padded card-id lists rather than length-V count vectors. Measured result: **46 bytes per row**, or about **267MB in RAM for the full corpus**, against roughly 1GB if pools were materialized and ~25x more again for dense count vectors. Ingest runs at ~51k rows/s, so a full pass is a few minutes.
+
+### Fetching it
+
+    curl -o data/raw/draft_data_public.FIN.PremierDraft.csv.gz       https://17lands-public.s3.amazonaws.com/analysis_data/draft_data/draft_data_public.FIN.PremierDraft.csv.gz
+
+    python -m src.data.ingest       --csv data/raw/draft_data_public.FIN.PremierDraft.csv.gz       --out data/processed/FIN.PremierDraft
+
+The gzip is never decompressed to disk; ingest streams it.
+
 ## Scryfall — card metadata
 
 Official bulk-data API (`api.scryfall.com/bulk-data`), live. Oracle Cards export is ~24MB gzipped, one JSON object per unique card: oracle text, mana cost, types, keywords. Used only to build the composite card embeddings (see `ARCHITECTURE.md`) and the naive text-overlap baseline — never as a training label. Standard, uncontroversial, no access concerns.

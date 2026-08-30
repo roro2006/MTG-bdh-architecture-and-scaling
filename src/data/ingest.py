@@ -1,0 +1,282 @@
+"""Streams a 17lands draft_data_public CSV(.gz) into compact numpy arrays.
+
+The raw file cannot be read into memory: a single set/event export is ~740
+columns wide and, for FIN.PremierDraft, roughly 9GB uncompressed across
+~5.8M picks. This module makes one chunked pass over it and writes a
+fixed-width binary form that does fit.
+
+Two decisions do most of the size reduction, both justified by the file's
+verified structure:
+
+  - the `pool_*` columns are never read. The pool at any pick is exactly
+    the set of that draft's earlier picks, so it is reconstructed at batch
+    time (see dataset.py) rather than stored. This halves the parse and
+    keeps the on-disk form from tripling in size.
+  - a pack is stored as its card ids padded to MAX_PACK_SIZE, not as a
+    length-V count vector. Packs hold at most 14 cards out of a
+    several-hundred-card vocabulary, so the dense form would be ~25x
+    larger for no gain.
+
+`pack_card_*` values are counts, not flags -- OTJ.PremierDraft really does
+contain packs with a card at count 2 -- so a card at count k is emitted k
+times into the pack list.
+
+Run directly:
+    python -m src.data.ingest --csv data/raw/draft_data_public.FIN.PremierDraft.csv.gz --out data/processed/FIN.PremierDraft
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import time
+from dataclasses import asdict, dataclass
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+from .vocab import Vocabulary, build_vocabulary
+
+# Arena draft packs hold 14 selectable cards. Verified against FIN and OTJ:
+# pack sizes run exactly 14 down to 1 across pick_number 0..13.
+MAX_PACK_SIZE = 14
+
+# Rows per chunk. 40k x 363 int8 columns is ~15MB of parsed values, which
+# keeps peak memory well under control while staying big enough that the
+# per-chunk numpy work is not dominated by overhead.
+DEFAULT_CHUNK_ROWS = 40_000
+
+_PACK_DTYPE = np.int16  # card ids; vocabularies here are a few hundred entries
+
+_ARRAY_NAMES = (
+    "pack",
+    "pack_size",
+    "label",
+    "label_pos",
+    "pack_number",
+    "pick_number",
+    "draft_idx",
+    "rank_code",
+    "win_rate_bucket",
+)
+
+
+@dataclass(frozen=True)
+class IngestStats:
+    """What the pass actually saw, for the run log and for sanity checks."""
+
+    rows: int
+    drafts: int
+    vocab_size: int
+    max_pack_seen: int
+    duplicate_card_rows: int
+    elapsed_seconds: float
+
+    def summary(self) -> str:
+        rate = self.rows / self.elapsed_seconds if self.elapsed_seconds else 0.0
+        return (
+            f"{self.rows:,} picks across {self.drafts:,} drafts "
+            f"(vocab {self.vocab_size}, max pack {self.max_pack_seen}, "
+            f"{self.duplicate_card_rows:,} rows with a duplicated card) "
+            f"in {self.elapsed_seconds:,.1f}s [{rate:,.0f} rows/s]"
+        )
+
+
+def _packs_from_counts(counts: np.ndarray) -> tuple[np.ndarray, np.ndarray, int]:
+    """Turns an (n_rows, vocab) count matrix into padded card-id lists.
+
+    Column position in `counts` is assumed to already be the card id, which
+    is what Vocabulary.pack_columns() guarantees by ordering the selection.
+    Returns (padded_packs, pack_sizes, n_rows_with_a_duplicate).
+    """
+    n_rows = counts.shape[0]
+    row_idx, col_idx = np.nonzero(counts)
+    reps = counts[row_idx, col_idx].astype(np.int64)
+
+    rows_rep = np.repeat(row_idx, reps)
+    cards_rep = np.repeat(col_idx, reps)
+
+    sizes = np.bincount(rows_rep, minlength=n_rows)
+    if sizes.max(initial=0) > MAX_PACK_SIZE:
+        raise ValueError(
+            f"pack of {sizes.max()} cards exceeds MAX_PACK_SIZE={MAX_PACK_SIZE}; "
+            "the export format has changed and the padding width needs revisiting"
+        )
+
+    # np.nonzero yields row-major order and np.repeat preserves it, so
+    # rows_rep is non-decreasing and each row's slots are contiguous.
+    starts = np.zeros(n_rows, dtype=np.int64)
+    np.cumsum(sizes[:-1], out=starts[1:])
+    positions = np.arange(rows_rep.size, dtype=np.int64) - starts[rows_rep]
+
+    packs = np.full((n_rows, MAX_PACK_SIZE), -1, dtype=_PACK_DTYPE)
+    packs[rows_rep, positions] = cards_rep.astype(_PACK_DTYPE)
+
+    n_dupes = int((reps > 1).sum())
+    return packs, sizes.astype(np.int8), n_dupes
+
+
+def ingest(
+    csv_path: str | Path,
+    out_dir: str | Path,
+    vocab: Vocabulary | None = None,
+    chunk_rows: int = DEFAULT_CHUNK_ROWS,
+    limit_rows: int | None = None,
+    verbose: bool = True,
+) -> IngestStats:
+    """One chunked pass over the raw export, writing picks.npz + vocab.json.
+
+    `limit_rows` caps the number of picks read, for developing against a
+    truncated sample of the file.
+    """
+    csv_path = Path(csv_path)
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    if vocab is None:
+        vocab = build_vocabulary(csv_path)
+
+    pack_columns = vocab.pack_columns()
+    meta_columns = [
+        "draft_id",
+        "rank",
+        "pack_number",
+        "pick_number",
+        "pick",
+        "user_game_win_rate_bucket",
+    ]
+
+    dtypes: dict[str, object] = {c: np.int8 for c in pack_columns}
+    dtypes.update({"draft_id": str, "rank": str, "pick": str})
+
+    chunks: dict[str, list[np.ndarray]] = {name: [] for name in _ARRAY_NAMES}
+    draft_id_to_idx: dict[str, int] = {}
+    rank_to_code: dict[str, int] = {}
+    n_rows = 0
+    max_pack_seen = 0
+    duplicate_card_rows = 0
+    started = time.monotonic()
+
+    reader = pd.read_csv(
+        csv_path,
+        chunksize=chunk_rows,
+        usecols=meta_columns + pack_columns,
+        dtype=dtypes,
+    )
+
+    for chunk in reader:
+        if limit_rows is not None and n_rows >= limit_rows:
+            break
+        if limit_rows is not None and n_rows + len(chunk) > limit_rows:
+            chunk = chunk.iloc[: limit_rows - n_rows]
+
+        # Selecting in vocabulary order makes column position == card id.
+        counts = chunk[pack_columns].to_numpy(dtype=np.int8, copy=False)
+        packs, sizes, n_dupes = _packs_from_counts(counts)
+        duplicate_card_rows += n_dupes
+        max_pack_seen = max(max_pack_seen, int(sizes.max(initial=0)))
+
+        labels = chunk["pick"].map(vocab.card_to_id)
+        if labels.isna().any():
+            unknown = sorted(set(chunk.loc[labels.isna(), "pick"]))[:5]
+            raise ValueError(f"picked cards absent from the vocabulary: {unknown}")
+        labels = labels.to_numpy(dtype=_PACK_DTYPE)
+
+        # The label must be a card physically in the pack; that invariant is
+        # the whole premise of the pointer head, so it is enforced, not assumed.
+        matches = packs == labels[:, None]
+        in_pack = matches.any(axis=1)
+        if not in_pack.all():
+            bad = int((~in_pack).sum())
+            raise ValueError(
+                f"{bad} rows near offset {n_rows} have a pick that is not in their pack"
+            )
+        label_pos = matches.argmax(axis=1).astype(np.int8)
+
+        for draft_id in chunk["draft_id"]:
+            if draft_id not in draft_id_to_idx:
+                draft_id_to_idx[draft_id] = len(draft_id_to_idx)
+        draft_idx = chunk["draft_id"].map(draft_id_to_idx).to_numpy(dtype=np.int32)
+
+        ranks = chunk["rank"].fillna("unknown")
+        for rank in ranks:
+            if rank not in rank_to_code:
+                rank_to_code[rank] = len(rank_to_code)
+        rank_code = ranks.map(rank_to_code).to_numpy(dtype=np.int8)
+
+        chunks["pack"].append(packs)
+        chunks["pack_size"].append(sizes)
+        chunks["label"].append(labels)
+        chunks["label_pos"].append(label_pos)
+        chunks["pack_number"].append(chunk["pack_number"].to_numpy(dtype=np.int8))
+        chunks["pick_number"].append(chunk["pick_number"].to_numpy(dtype=np.int8))
+        chunks["draft_idx"].append(draft_idx)
+        chunks["rank_code"].append(rank_code)
+        chunks["win_rate_bucket"].append(
+            chunk["user_game_win_rate_bucket"].to_numpy(dtype=np.float32)
+        )
+
+        n_rows += len(chunk)
+        if verbose:
+            elapsed = time.monotonic() - started
+            print(
+                f"  {n_rows:,} picks / {len(draft_id_to_idx):,} drafts "
+                f"({elapsed:,.0f}s, {n_rows / max(elapsed, 1e-9):,.0f} rows/s)",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    if n_rows == 0:
+        raise ValueError(f"no rows read from {csv_path}")
+
+    arrays = {name: np.concatenate(parts) for name, parts in chunks.items()}
+    stats = IngestStats(
+        rows=n_rows,
+        drafts=len(draft_id_to_idx),
+        vocab_size=vocab.size,
+        max_pack_seen=max_pack_seen,
+        duplicate_card_rows=duplicate_card_rows,
+        elapsed_seconds=time.monotonic() - started,
+    )
+
+    draft_ids = np.array(list(draft_id_to_idx), dtype="U32")
+    rank_names = np.array(list(rank_to_code), dtype="U16")
+
+    vocab.save(out_dir / "vocab.json")
+    np.savez_compressed(
+        out_dir / "picks.npz",
+        draft_ids=draft_ids,
+        rank_names=rank_names,
+        **arrays,
+    )
+    (out_dir / "ingest_stats.json").write_text(
+        json.dumps(asdict(stats), indent=2), encoding="utf-8"
+    )
+    return stats
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Ingest a 17lands draft export.")
+    parser.add_argument(
+        "--csv", required=True, help="path to draft_data_public.<SET>.<EVENT>.csv.gz"
+    )
+    parser.add_argument(
+        "--out", required=True, help="output directory for picks.npz + vocab.json"
+    )
+    parser.add_argument("--chunk-rows", type=int, default=DEFAULT_CHUNK_ROWS)
+    parser.add_argument(
+        "--limit-rows", type=int, default=None, help="stop after N picks (for dev)"
+    )
+    args = parser.parse_args(argv)
+
+    stats = ingest(
+        args.csv, args.out, chunk_rows=args.chunk_rows, limit_rows=args.limit_rows
+    )
+    print(stats.summary())
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -5,3 +5,4 @@ optax
 numpy
 pandas
 scipy
+pytest
