@@ -24,7 +24,9 @@ Structure was verified by range-fetching and decompressing the first 600KB rathe
 - Packs hold **14** selectable cards, not 15, and 42 picks make a draft (3 x 14).
 - Card names contain commas (`pack_card_Zidane, Tantalus Thief`), so the header needs a real CSV parser; a `split(",")` shreds 41 of OTJ's 381 columns.
 
-Extrapolating the observed 42.5x compression ratio puts the full file at roughly **9.2GB uncompressed, ~5.8M picks across ~139k drafts**. That does not fit in memory as a dataframe, which is what `src/data/ingest.py` exists to deal with.
+Extrapolating the observed 42.5x compression ratio put the full file at roughly 9.2GB uncompressed, ~5.8M picks across ~139k drafts. The actual ingest came in at **5,889,954 picks across 140,237 drafts**, so that estimate held. The raw file does not fit in memory as a dataframe, which is what `src/data/ingest.py` exists to deal with.
+
+Ingested, the corpus is **253MB in RAM (43.0 bytes/row)** and 73.7MB on disk as compressed `.npz`. The full pass takes 271s at ~21.7k rows/s, gzip decompression included. Unlike `OTJ`, FIN contains **no incomplete drafts** — all 140,237 have their full 42 picks, and none were dropped.
 
 ### The pool columns are redundant, and dropping them is what makes this fit
 

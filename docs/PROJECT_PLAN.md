@@ -50,17 +50,31 @@ The interesting result isn't just "the fitted $E$ matches the floor." A mismatch
 
 ### 6a. Measured: exact state matching does not work, and the obvious relaxation is a trap
 
-This was checked against real FIN data (16,212 picks, 386 drafts) as soon as the ingest pipeline could produce it, rather than being left as a stage-6 discovery. Two findings, both load-bearing:
+This was checked on the **full FIN corpus — all 5,889,954 picks across 140,237 drafts** — as soon as the ingest pipeline could produce it, rather than being left as a stage-6 discovery. Two findings, both load-bearing:
 
-**Exact `(pack, pool, pack_number, pick_number)` matching yields zero recurring states.** Not "few" — zero. The reason is structural rather than a sample-size artifact: the pool is a near-unique fingerprint almost immediately. By pack 0 pick 2, when the pool holds just *two* cards, 380 of 386 pools are already distinct; from pool size 12 onward every pool in the sample is unique. Since pool size is fully determined by `pack_number` and `pick_number`, an exact match needs a pool collision, and pools stop colliding almost at once. Scaling to the full ~5.8M-pick corpus does not fix this — it is a statement about how fast the state space opens up, not about how many samples were drawn.
+**Exact `(pack, pool, pack_number, pick_number)` matching yields zero recurring states.** Not "few" — zero, across the entire corpus. The reason is structural rather than a sample-size artifact: the pool is a near-unique fingerprint almost immediately. By pack 0 pick 2, when the pool holds just *two* cards, 380 of 386 pools in a 386-draft sample are already distinct; from pool size 12 onward every pool is unique. Since pool size is fully determined by `pack_number` and `pick_number`, an exact match needs a pool collision, and pools stop colliding almost at once. Going from a 16k-pick sample to the full 5.9M-pick corpus — a 363x increase — moved this number from zero to zero. It is a statement about how fast the state space opens up, not about how many samples were drawn.
 
-**Dropping the pool from the state key — the natural first relaxation — concentrates all the recurrence on decisions that aren't decisions.** Matching on `(pack, pack_number, pick_number)` alone does find recurrence, 7.4% of rows. But 100% of those rows sit at picks 11–13, and 91.4% at pick 13, where the pack contains exactly one card and the loss is identically zero. Packs collide there for the trivial reason that a 1-card pack has only 363 possible values. A floor measured over that subset would be measured almost entirely over forced non-choices, and would come back near zero — an apparently clean number that means nothing, and would make any fitted $E$ look badly miscalibrated for reasons that have nothing to do with the models.
+**Dropping the pool from the state key — the natural first relaxation — concentrates the recurrence on decisions that are not decisions.** Matching on `(pack, pack_number, pick_number)` alone does find recurrence: 1,186,676 rows, 20.15% of the corpus, in 114,099 groups. But the distribution across the draft is fatal to the measurement:
+
+| pick | pack size | rows in a recurring state | share of that pick |
+|-----:|----------:|--------------------------:|-------------------:|
+| 0–3  | 14–11     | 0                         | 0.0%               |
+| 4–8  | 10–6      | 1,377                     | <0.3%              |
+| 9    | 5         | 4,575                     | 1.1%               |
+| 10   | 4         | 50,972                    | 12.1%              |
+| 11   | 3         | 292,861                   | 69.6%              |
+| 12   | 2         | 416,188                   | 98.9%              |
+| 13   | 1         | 420,703                   | 100.0%             |
+
+95.2% of all recurrence sits at picks 11–13, where the pack holds three cards or fewer; at pick 13 the pack holds exactly one card and the loss is identically zero. Packs collide there for the trivial reason that a 1-card pack has only 363 possible values — those 420,703 rows fall into just 277 distinct groups. Meanwhile the entire region where a real decision exists, picks 0 through 8, contributes **1,377 rows: 0.12% of the recurrence, and 0.02% of those picks**. Nothing at all before pick 4.
+
+A floor measured over the relaxed subset would therefore be measured almost entirely over forced non-choices and would come back near zero — an apparently clean number that means nothing, and one that would make any fitted $E$ look badly miscalibrated for reasons having nothing to do with the models. Restricting the same relaxation to picks 0–8 to avoid that gives 1,377 rows across ~679 groups, which is far too thin to fit a stable floor and is itself concentrated at picks 7–8.
 
 So the fallback named in §8 is not a contingency any more; it is the primary path, and it needs to be a relaxation that stays in the part of the draft where a real decision exists (roughly picks 0–8, where the pack still holds six or more cards). The relaxation has to be *chosen and justified*, not defaulted into. The candidates worth weighing:
 
 - **Coarsen the pool, keep the pack exact.** Condition on a summary of the pool — its color distribution, curve, creature/spell split — rather than its exact contents. Two drafters with the same pack and a similarly-shaped pool are facing substantially the same decision, which is the thing the floor is supposed to measure.
 - **Drop to pairwise preference.** For each card pair $(A, B)$ that co-occurs in a pack, measure how often $A$ is taken over $B$, conditioned on a coarse pool descriptor. Sample sizes become large, but it measures a different quantity than per-state entropy and the writeup would have to say so plainly.
-- **Restrict to early picks and accept a smaller subset.** Keeps the exact-match discipline; may simply not yield enough states to be stable.
+- **Restrict to early picks and accept a smaller subset.** Keeps the exact-match discipline, but is now measured and ruled out on its own: 1,377 rows at picks 0–8, none before pick 4. Not enough to fit anything stable.
 
 Whichever is chosen, the relaxation gets stated in the writeup as a first-class methodological decision with this measurement attached, not as a footnote.
 
@@ -76,7 +90,7 @@ Whichever is chosen, the relaxation gets stated in the writeup as a first-class 
 - **BDH instability.** Addressed above, but worth repeating: this is not a battle-tested architecture, and the porting stage should be budgeted like a research task, not a translation exercise.
 - **Iso-parameter vs. iso-compute.** Reporting only one of them makes the headline claim ambiguous. Both get reported, always.
 - **Grid compute budget.** 80 runs is the target; cut seeds before cutting grid coverage if time runs short.
-- **Thin matched-state subset — now measured, and worse than "thin".** Exact-match recurring states do not merely turn out to be rare; on real FIN data there are *none*, and the obvious relaxation puts 100% of its recurrence on picks 11–13 where the pack holds three cards or fewer. See §6a for the numbers and the candidate relaxations. This is the open methodological question in the project, and it is worth settling before the grid consumes real compute, because the floor comparison is half of what makes the study more than a curve fit.
+- **Thin matched-state subset — now measured on the full corpus, and worse than "thin".** Exact-match recurring states do not merely turn out to be rare; across all 5,889,954 FIN picks there are *none*, and the obvious relaxation puts 95.2% of its recurrence on picks 11–13 where the pack holds three cards or fewer, against 0.12% across every pick where a real decision exists. See §6a for the numbers and the candidate relaxations. This is the open methodological question in the project, and it is worth settling before the grid consumes real compute, because the floor comparison is half of what makes the study more than a curve fit.
 
 ## 9. Build order
 

@@ -15,9 +15,9 @@ There's a second piece worth stating plainly, because it's what separates this f
 
 Nothing has been trained yet. The data pipeline (`src/data/`) is implemented and tested: vocabulary construction, a streaming ingest that turns the ~9GB raw export into ~267MB of arrays, pool reconstruction, draft-level splitting, and matched-state grouping. Everything else — both model arms, the grid runner, the fitting code — is still a skeleton. Implementation is being built out in stages, each landing as its own commit rather than one dump.
 
-The set under study is **FIN.PremierDraft**: 363 cards, ~5.8M picks across ~139k drafts.
+The set under study is **FIN.PremierDraft**: 363 cards, 5,889,954 picks across 140,237 drafts, ingested and sitting at 253MB in RAM.
 
-One finding from the data stage is already worth flagging, because it changes the plan rather than just filling it in: the human-disagreement floor described above cannot be measured the way §6 originally specified. Exact recurring `(pack, pool)` states do not exist in this data — not rarely, but *zero* — because a pool of even two cards is already a near-unique fingerprint. The obvious relaxation is worse than it looks: dropping the pool from the state key puts 100% of the resulting recurrence on the last three picks of a pack, where the pack holds three cards or fewer and 91% of the time the "decision" is a single forced card. See `docs/PROJECT_PLAN.md` §6a for the measurements and the candidate fixes.
+One finding from the data stage is already worth flagging, because it changes the plan rather than just filling it in: the human-disagreement floor described above cannot be measured the way §6 originally specified. Exact recurring `(pack, pool)` states do not exist in this data — not rarely, but *zero across all 5.9M picks* — because a pool of even two cards is already a near-unique fingerprint. The obvious relaxation is worse than it looks: dropping the pool from the state key puts 95% of the resulting recurrence on the last three picks of a pack, where the pack holds three cards or fewer and the "decision" is often a single forced card, while every pick where a real decision exists contributes 0.12% of it. See `docs/PROJECT_PLAN.md` §6a for the measurements and the candidate fixes.
 
 ## Layout
 
