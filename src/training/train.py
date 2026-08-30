@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import asdict, dataclass
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -107,8 +108,15 @@ def train_model(
     train_config: TrainConfig,
     arm: str = "attention",
     verbose: bool = True,
+    checkpoint_dir: str | Path | None = None,
 ) -> dict:
-    """Trains one cell and returns its metrics plus the metadata the fit needs."""
+    """Trains one cell and returns its metrics plus the metadata the fit needs.
+
+    If `checkpoint_dir` is given, the parameters are written there whenever
+    validation loss improves. A grid cell is tens of minutes of compute;
+    losing all of it to a crash at step 2,900 is avoidable, and the
+    best-val parameters are what any later analysis wants anyway.
+    """
     model, params = init_model(model_config, feature_table, arm=arm, seed=train_config.seed)
     analytic = count_params_analytic(model_config, arm=arm)
     actual = count_params_actual(params)
@@ -167,6 +175,9 @@ def train_model(
     stream = _batch_stream(data, train_indices, train_config.batch_size, train_config.seed)
     history: list[dict] = []
     started = time.monotonic()
+    best_val = float("inf")
+    best_params = params
+    best_step = 0
 
     for step in range(1, train_config.total_steps + 1):
         batch = {k: jnp.asarray(v) for k, v in next(stream).items()}
@@ -175,6 +186,23 @@ def train_model(
         if step % train_config.eval_every == 0 or step == train_config.total_steps:
             val_loss, val_accuracy = evaluate()
             elapsed = time.monotonic() - started
+            improved = val_loss < best_val
+            if improved:
+                best_val, best_params, best_step = val_loss, params, step
+                if checkpoint_dir is not None:
+                    # Imported here to keep checkpoint.py free to import from
+                    # this module later without a cycle.
+                    from .checkpoint import save_checkpoint
+
+                    save_checkpoint(
+                        checkpoint_dir,
+                        params,
+                        model_config=model_config,
+                        arm=arm,
+                        train_config=train_config,
+                        metrics={"step": step, "val_loss": val_loss,
+                                 "val_accuracy": val_accuracy},
+                    )
             history.append(
                 {
                     "step": step,
@@ -189,7 +217,8 @@ def train_model(
                 print(
                     f"  step {step:>6,}  train {float(loss):.4f}  val {val_loss:.4f}  "
                     f"val_acc {val_accuracy:.4f}  ({elapsed:,.0f}s, "
-                    f"{step * train_config.batch_size / elapsed:,.0f} ex/s)",
+                    f"{step * train_config.batch_size / elapsed:,.0f} ex/s)"
+                    f"{'  *' if improved else ''}",
                     flush=True,
                 )
 
@@ -208,6 +237,10 @@ def train_model(
         "history": history,
         "model_config": asdict(model_config),
         "train_config": asdict(train_config),
+        "best_val_loss": best_val,
+        "best_step": best_step,
         "elapsed_s": time.monotonic() - started,
+        "model": model,
         "params": params,
+        "best_params": best_params,
     }
