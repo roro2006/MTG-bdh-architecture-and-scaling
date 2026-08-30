@@ -23,3 +23,7 @@ checkpoints/
 # os
 .DS_Store
 Thumbs.db
+
+# runs and sweeps
+runs/
+sweeps/

@@ -27,56 +27,11 @@ from src.data.dataset import (
 from src.data.ingest import ingest
 from src.data.vocab import build_vocabulary
 
-# One name carries a comma, as real cards do ("Zidane, Tantalus Thief").
-CARDS = [f"Card {i:02d}" for i in range(20)] + ["Zidane, Tantalus Thief"]
-CARDS = sorted(CARDS)
-
-
-def _write_export(path, drafts, gzipped=True):
-    """Writes a minimal but format-faithful draft_data_public CSV.
-
-    `drafts` is a list of (draft_id, packs) where packs is a list of
-    PACKS_PER_DRAFT lists, each holding PICKS_PER_PACK card names in the
-    order that drafter took them.
-    """
-    columns = (
-        ["expansion", "event_type", "draft_id", "draft_time", "rank",
-         "event_match_wins", "event_match_losses", "pack_number", "pick_number",
-         "pick", "pick_maindeck_rate", "pick_sideboard_in_rate"]
-        + [f"pack_card_{c}" for c in CARDS]
-        + [f"pool_{c}" for c in CARDS]
-        + ["user_n_games_bucket", "user_game_win_rate_bucket"]
-    )
-    opener = gzip.open if gzipped else open
-    with opener(path, "wt", encoding="utf-8", newline="") as handle:
-        writer = csv.writer(handle)
-        writer.writerow(columns)
-        for draft_id, packs in drafts:
-            pool: list[str] = []
-            for pack_number, taken in enumerate(packs):
-                for pick_number in range(len(taken)):
-                    remaining = taken[pick_number:]
-                    pack_counts = {c: 0 for c in CARDS}
-                    for c in remaining:
-                        pack_counts[c] += 1
-                    pool_counts = {c: 0 for c in CARDS}
-                    for c in pool:
-                        pool_counts[c] += 1
-                    writer.writerow(
-                        ["TST", "PremierDraft", draft_id, "2025-01-01 00:00:00",
-                         "gold", 3, 2, pack_number, pick_number, taken[pick_number],
-                         1.0, 0.0]
-                        + [pack_counts[c] for c in CARDS]
-                        + [pool_counts[c] for c in CARDS]
-                        + [3, 0.55]
-                    )
-                    pool.append(taken[pick_number])
+from .synthetic import CARDS, make_draft, write_export as _write_export
 
 
 def _draft(rng, draft_id):
-    packs = [list(rng.choice(CARDS, size=PICKS_PER_PACK, replace=False))
-             for _ in range(PACKS_PER_DRAFT)]
-    return (draft_id, packs)
+    return make_draft(rng, draft_id)
 
 
 @pytest.fixture

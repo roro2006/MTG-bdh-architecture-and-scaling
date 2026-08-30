@@ -56,6 +56,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--pack-layers", type=int, default=1)
     parser.add_argument("--num-heads", type=int, default=4)
     parser.add_argument("--steps", type=int, default=3000)
+    parser.add_argument(
+        "--epochs", type=float, default=None,
+        help="train for this many passes over the subsampled training set, "
+             "overriding --steps. Preferred for grid cells: with fixed steps "
+             "a small --data-fraction silently means many epochs, and the "
+             "fitted beta then measures data repetition rather than data scale.",
+    )
     parser.add_argument("--batch-size", type=int, default=512)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--eval-every", type=int, default=250)
@@ -96,12 +103,25 @@ def main(argv: list[str] | None = None) -> int:
         arm_layers=args.arm_layers,
         card_feature_dim=table.shape[1],
     )
+    steps = args.steps
+    if args.epochs is not None:
+        steps = max(1, int(round(args.epochs * train_indices.size / args.batch_size)))
+        print(f"--epochs {args.epochs:g} over {train_indices.size:,} rows -> {steps:,} steps")
+
+    epochs = steps * args.batch_size / max(train_indices.size, 1)
+    if epochs > 2.0:
+        print(
+            f"  NOTE: this cell makes {epochs:.1f} passes over its training set. "
+            "Beyond about one pass the D axis starts measuring repetition rather "
+            "than data scale; see src/training/README.md."
+        )
+
     train_config = TrainConfig(
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
-        total_steps=args.steps,
+        total_steps=steps,
         eval_every=args.eval_every,
-        warmup_steps=max(50, args.steps // 20),
+        warmup_steps=max(50, steps // 20),
         seed=args.seed,
     )
 
@@ -126,9 +146,9 @@ def main(argv: list[str] | None = None) -> int:
         "train_drafts": int(np.unique(data.draft_idx[train_indices]).size),
         "data_fraction": args.data_fraction,
         "seed": args.seed,
-        "steps": args.steps,
-        "examples_seen": args.steps * args.batch_size,
-        "epochs": args.steps * args.batch_size / max(train_indices.size, 1),
+        "steps": steps,
+        "examples_seen": steps * args.batch_size,
+        "epochs": epochs,
         "history": result["history"],
         "sampled_final_val_loss": result["final_val_loss"],
         "best_val_loss": result["best_val_loss"],

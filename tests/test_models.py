@@ -28,16 +28,14 @@ from src.models.pick_model import (
     init_model,
 )
 
-VOCAB_SIZE = 40
-FEATURE_DIM = 65
+from .conftest import VOCAB_SIZE
+from .synthetic import FEATURE_DIM
+
 MAX_PACK = 14
 MAX_POOL = 41
 
-
-@pytest.fixture(scope="module")
-def feature_table():
-    rng = np.random.default_rng(0)
-    return jnp.asarray(rng.normal(size=(VOCAB_SIZE, FEATURE_DIM)).astype(np.float32))
+# `feature_table` comes from conftest.py, session-scoped: model tests all
+# want the same table and rebuilding it per module bought nothing.
 
 
 def _config(hidden_dim: int = 32) -> ModelConfig:

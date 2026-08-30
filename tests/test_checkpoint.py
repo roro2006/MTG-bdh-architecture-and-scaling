@@ -27,14 +27,8 @@ from src.training.checkpoint import (
 from src.training.evaluate import summarise_by_pick
 from src.training.train import TrainConfig
 
-VOCAB_SIZE = 40
-FEATURE_DIM = 65
-
-
-@pytest.fixture(scope="module")
-def feature_table():
-    rng = np.random.default_rng(0)
-    return jnp.asarray(rng.normal(size=(VOCAB_SIZE, FEATURE_DIM)).astype(np.float32))
+from .conftest import VOCAB_SIZE
+from .synthetic import FEATURE_DIM
 
 
 def _config(hidden_dim=32):
