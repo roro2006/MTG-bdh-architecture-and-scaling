@@ -192,6 +192,22 @@ class PickData:
         out = np.where(valid, self.label[np.clip(gather, 0, self.size - 1)], PAD_ID)
         return out.astype(np.int16)
 
+    def batch(self, indices: np.ndarray) -> dict[str, np.ndarray]:
+        """Model inputs for a set of rows, as int32 numpy arrays.
+
+        Ids stay -1-padded rather than being one-hot expanded; the model
+        masks on `>= 0` and gathers features itself.
+        """
+        indices = np.asarray(indices, dtype=np.int64)
+        return {
+            "pack_ids": self.pack[indices].astype(np.int32),
+            "pool_ids": self.pools_padded(indices).astype(np.int32),
+            "pack_number": self.pack_number[indices].astype(np.int32),
+            "pick_number": self.pick_number[indices].astype(np.int32),
+            "label_pos": self.label_pos[indices].astype(np.int32),
+            "label": self.label[indices].astype(np.int32),
+        }
+
     def example(self, i: int) -> DraftExample:
         pack = self.pack[i]
         return DraftExample(
