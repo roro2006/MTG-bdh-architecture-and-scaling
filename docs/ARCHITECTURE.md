@@ -28,8 +28,37 @@ Composite embeddings, set encoding, and the pointer output head are identical be
 - **Attention arm** — the cross-attention block described above.
 - **BDH arm** — BDH's sparse, Hebbian-plasticity block substituted in the same position, consuming the same pool/pack representations and producing the same shape of output for the pointer head to score against.
 
-No existing JAX implementation of BDH exists; the reference implementation (`pathwaycom/bdh`) is a bare PyTorch script. Porting it is real work and gets its own acceptance test — training it on a small toy task and confirming it actually converges and that its sparsity/positivity properties hold in this implementation — before it's allowed anywhere near the full scaling grid. See `PROJECT_PLAN.md` §3 for how that's staged.
+No existing JAX implementation of BDH exists; the reference implementation (`pathwaycom/bdh`) is a bare PyTorch script. The port lives in `src/models/bdh_arm.py`.
+
+**Two things in the reference had to go, and both for the reason this document already gives.** The reference is a causal language model: it applies RoPE to its query/key features and masks its scores with `tril(diagonal=-1)`. Both encode token order. A pool is a set, so there is no order for them to encode, and keeping them would have contradicted "Why not a plain causal transformer" above — the same commitment that rules out a causal transformer for the attention arm rules out a causal BDH. The port keeps everything that makes BDH BDH (the wide ReLU neuron space, the absence of a softmax, the Hebbian accumulation, the multiplicative gate, the low-rank encode/decode) and drops the two pieces that are about sequences. `tests/test_kernels.py` asserts the result is exactly invariant to permuting the pool, which is the property that would break first if order ever crept back in.
+
+**Sizing had to change too.** The reference's `mlp_internal_dim_multiplier=128` gives a neuron width of `N = 32*D`, or roughly 25M parameters for one layer at `D=256` — against 0.8M for a cross-attention block. No iso-parameter grid is possible at that ratio. `neuron_multiplier=4` makes a BDH layer cost `3·m·D² = 12·D²` against a cross-attention block's `12·D² + 15·D`: iso-parameter to within a term linear in D, and 1,572,864 against 1,581,312 at `D=256` in practice — a 0.5% gap on the arm and 0.2% on the model total.
 
 ## A fairness note for the scaling comparison
 
 Matching the two arms on parameter count ($N$) is not the same as matching them on compute, precisely because BDH's activations are sparse by design — a forward pass can do meaningfully less arithmetic than a dense attention block with the same number of weights. Reporting only an iso-parameter curve would let "which architecture scales better" quietly mean two different things depending on which axis is held fixed. Both an iso-parameter and an iso-FLOP comparison are reported for exactly this reason — see `PROJECT_PLAN.md` §3d and §5.
+
+### What the FLOP accounting actually showed
+
+Deriving BDH's FLOP count term by term (`src/models/flops.py::_bdh_layer`) changed the picture, and the numbers below should be read before anyone writes "BDH does less arithmetic" in a results section.
+
+**Sparsity can only skip two of the six terms.** A BDH layer spends its arithmetic on three `D → N` encodes, an interaction score, a value matmul, and an `nh·N → D` decode. Only the score and the decode reduce over the neuron axis against sparse operands, so only they shrink with density. The three encodes are paid in full at *any* density, for an unavoidable reason: you cannot know a ReLU will output zero without first computing its input. That is not an implementation limitation, it is the shape of the computation.
+
+At `D=256` and the iso-parameter sizing, the consequences are stark:
+
+| | forward FLOPs, arm only |
+|---|---|
+| attention arm | 59.9M |
+| BDH arm, dense | 91.7M (1.53× attention) |
+| BDH arm, ideal at 25% density | 79.0M (86% of dense) |
+| BDH arm, ideal at 2% density | 75.0M (82% of dense) |
+
+So at this sizing BDH starts 53% *more* expensive than the arm it is being compared against, and perfect sparsity exploitation would claw back at most about 18%. The floor is the encodes. **A sparsity-based efficiency claim does not survive contact with this architecture at iso-parameter sizing**, and the honest iso-FLOP comparison is between the dense counts.
+
+That does not make the comparison uninteresting — it means the interesting question is quality per parameter and per dense FLOP, not a sparsity dividend. If a sparsity dividend is wanted, it needs either a much larger `neuron_multiplier` (where the encodes stop dominating, but iso-parameter is lost) or block-structured sparsity, which is an architectural change rather than a kernel one. `bdh_ideal_flops` computes the bound for any measured density, and `measure_density` supplies the density from a real batch rather than an assumption — at initialisation it is ~0.5, which is a property of the initialiser and says nothing about a trained model.
+
+### Dense FLOPs are what the hardware runs
+
+Both arms have fused Pallas kernels (`src/models/kernels/`). They win **memory traffic**, not arithmetic: unstructured zeros still occupy a lane in a tensor-core tile, so a GPU multiplies by zero exactly as fast as by anything else. Anything reported on a wall-clock axis should say which of the two it means.
+
+The kernels exist for both arms deliberately. The attention arm is the control; hand-optimising only BDH would mean any wall-clock difference measured kernel effort rather than architecture.
