@@ -64,6 +64,7 @@ class CrossAttentionArm(nn.Module):
     num_heads: int
     num_layers: int
     mlp_ratio: int = 4
+    fused: bool = False
 
     @nn.compact
     def __call__(
@@ -74,6 +75,13 @@ class CrossAttentionArm(nn.Module):
         pool_mask: jnp.ndarray,              # (B, L_pool)
         context: jnp.ndarray,                # (B, D) pack/pick number features
     ) -> jnp.ndarray:
+        if self.fused:
+            # Local import to keep src.models.kernels off the import path of
+            # anyone who only wants the reference blocks.
+            from .kernels.cross_attention import FusedCrossAttentionBlock as Block
+        else:
+            Block = CrossAttentionBlock
+
         batch = pack_representations.shape[0]
 
         # A learned null key, always visible.
@@ -95,7 +103,7 @@ class CrossAttentionArm(nn.Module):
 
         queries = pack_representations + context[:, None, :]
         for layer in range(self.num_layers):
-            queries = CrossAttentionBlock(
+            queries = Block(
                 hidden_dim=self.hidden_dim,
                 num_heads=self.num_heads,
                 mlp_ratio=self.mlp_ratio,

@@ -26,6 +26,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from .attention_arm import CrossAttentionArm
+from .bdh_arm import BDHArm, neuron_count
 from .embeddings import CardEmbedding, ContextFeatures, gather_card_features
 from .set_encoder import SetEncoder
 
@@ -45,6 +46,15 @@ class ModelConfig:
     arm_layers: int = 2
     mlp_ratio: int = 4
     set_encoder_mode: str = "attention"
+    # BDH's neuron width per head is neuron_multiplier * hidden_dim // heads.
+    # 4 makes a BDH layer cost 12*D^2 against a cross-attention block's
+    # 12*D^2 + 15*D; the reference's own default of 128 is 32x larger and
+    # would make an iso-parameter grid impossible. See src/models/bdh_arm.py.
+    neuron_multiplier: int = 4
+    # Route both arms through their Pallas kernels. Parameter trees and
+    # values are unchanged (tests/test_kernels.py), so this is purely an
+    # execution choice and can be flipped per run.
+    fused_kernels: bool = False
     embed_hidden_dim: int | None = None
     card_feature_dim: int = 65
     packs_per_draft: int = 3
@@ -126,12 +136,18 @@ class PickModel(nn.Module):
                 num_heads=config.num_heads,
                 num_layers=config.arm_layers,
                 mlp_ratio=config.mlp_ratio,
+                fused=config.fused_kernels,
                 name="arm",
             )(pack_repr, pack_mask, pool_repr, pool_mask, context)
         elif self.arm == "bdh":
-            raise NotImplementedError(
-                "the BDH arm is stage 4; see docs/PROJECT_PLAN.md section 3a"
-            )
+            candidates = BDHArm(
+                hidden_dim=config.hidden_dim,
+                num_heads=config.num_heads,
+                num_layers=config.arm_layers,
+                neuron_multiplier=config.neuron_multiplier,
+                fused=config.fused_kernels,
+                name="arm",
+            )(pack_repr, pack_mask, pool_repr, pool_mask, context)
         else:
             raise ValueError(f"unknown arm {self.arm!r}")
 
@@ -183,6 +199,15 @@ def _cross_block(d: int, ratio: int) -> int:
     )
 
 
+def _bdh_block(d: int, num_heads: int, n: int) -> int:
+    """encoder + encoder_v + decoder. No biases, no norm parameters.
+
+    Equals 3 * neuron_multiplier * d**2, so neuron_multiplier=4 lands
+    within O(d) of _cross_block's 12*d**2 + 15*d.
+    """
+    return 3 * num_heads * d * n
+
+
 def count_params_analytic(config: ModelConfig, arm: str = "attention") -> dict[str, int]:
     """Per-component parameter counts, and their total under "total"."""
     d = config.hidden_dim
@@ -206,6 +231,14 @@ def count_params_analytic(config: ModelConfig, arm: str = "attention") -> dict[s
             + config.arm_layers * _cross_block(d, r)
             + _layer_norm(d)
         )
+    elif arm == "bdh":
+        # A BDH layer is exactly its three projections: encoder (D->N),
+        # encoder_v (D->N) and decoder (nh*N->D), all bias-free, with
+        # affine-free LayerNorms that carry no parameters at all. There is
+        # no null key either -- an empty pool contributes a zero score
+        # rather than needing something legal to attend to.
+        n = neuron_count(d, config.num_heads, config.neuron_multiplier)
+        counts["arm"] = config.arm_layers * _bdh_block(d, config.num_heads, n)
     else:
         raise NotImplementedError(f"no analytic count for arm {arm!r}")
 

@@ -12,6 +12,8 @@ No data download is needed: features and ids are synthesised here.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -199,11 +201,47 @@ def test_padding_in_the_pool_does_not_change_the_answer(feature_table):
     assert np.allclose(logits, logits_moved, atol=1e-4)
 
 
-def test_unknown_arm_is_rejected_and_bdh_is_explicitly_pending(feature_table):
-    with pytest.raises(NotImplementedError, match="stage 4"):
-        init_model(_config(), feature_table, arm="bdh", seed=0)
+def test_unknown_arm_is_rejected(feature_table):
     with pytest.raises(ValueError, match="unknown arm"):
         init_model(_config(), feature_table, arm="mamba", seed=0)
+
+
+def test_both_arms_build_and_share_everything_but_the_arm(feature_table):
+    """The grid's premise: swapping the arm changes the arm and nothing else.
+
+    Checked on the parameter tree rather than the total, because a total
+    can coincide while the front-end quietly differs.
+    """
+    config = _config()
+    shared = {}
+    for arm in ("attention", "bdh"):
+        _, params = init_model(config, feature_table, arm=arm, seed=0)
+        tree = params["params"]
+        assert set(tree) == {
+            "card_embedding", "pack_encoder", "pool_encoder", "context", "arm", "pointer"
+        }
+        shared[arm] = {k: jax.tree_util.tree_structure(v)
+                       for k, v in tree.items() if k != "arm"}
+    assert shared["attention"] == shared["bdh"]
+
+
+def test_neuron_multiplier_four_is_iso_parameter_with_attention(feature_table):
+    """Why the default is 4 and not the reference's 128.
+
+    A BDH layer costs 3*multiplier*D^2 against a cross-attention block's
+    12*D^2 + 15*D, so multiplier=4 matches to within a term linear in D.
+    The reference's own default would be 32x larger and no iso-parameter
+    grid would be possible at all.
+    """
+    config = _config(hidden_dim=256)
+    attention = count_params_analytic(config, "attention")["arm"]
+    bdh = count_params_analytic(config, "bdh")["arm"]
+    assert bdh == pytest.approx(attention, rel=0.01)
+
+    fat = count_params_analytic(
+        replace(config, neuron_multiplier=128), "bdh"
+    )["arm"]
+    assert fat > 30 * attention
 
 
 def test_loss_matches_a_hand_computed_softmax(feature_table):
