@@ -345,6 +345,62 @@ def test_bdh_arm_ignores_pool_order(arm_inputs):
     assert close(arm.apply(params, *args), shuffled)
 
 
+@pytest.mark.parametrize(
+    "arm_cls,kwargs",
+    [(CrossAttentionArm, {}), (BDHArm, {"neuron_multiplier": 4})],
+    ids=["attention", "bdh"],
+)
+def test_fused_arm_works_under_jit(arm_inputs, arm_cls, kwargs):
+    """Training runs jitted, so eager agreement is not enough on its own.
+
+    This exists because it caught a real bug: the head-dimension scale was
+    computed as `float(jnp.sqrt(dh))`, which is fine eagerly -- the sqrt
+    evaluates to a concrete array -- but under a trace it stages out to a
+    tracer, and `float()` on a tracer raises ConcretizationTypeError. Every
+    other test in this file ran eagerly and passed while the kernel was
+    unusable in the only mode that matters.
+
+    Asserting `pallas_call` actually appears in the jaxpr matters just as
+    much: without it a silent fallback to the reference path would make
+    every other test here pass for the wrong reason.
+    """
+    build = lambda **extra: arm_cls(
+        hidden_dim=D, num_heads=HEADS, num_layers=2, **kwargs, **extra
+    )
+    reference, fused = build(), build(fused=True)
+    args = (
+        arm_inputs["pack"],
+        arm_inputs["pack_mask"],
+        arm_inputs["pool"],
+        arm_inputs["pool_mask"],
+        arm_inputs["context"],
+    )
+    params = reference.init(jax.random.key(13), *args)
+
+    # Padded pack slots are compared out for the same reason as in
+    # test_fused_arm_matches_reference_arm: the two paths deliberately
+    # disagree there, and PointerHead discards those slots.
+    valid = arm_inputs["pack_mask"][..., None]
+    forward = jax.jit(
+        lambda module, p: jnp.where(valid, module.apply(p, *args), 0.0),
+        static_argnums=0,
+    )
+    assert "pallas_call" in str(jax.make_jaxpr(lambda p: fused.apply(p, *args))(params))
+    assert close(forward(reference, params), forward(fused, params))
+
+    weight = jax.random.normal(jax.random.key(14), (BATCH, PACK, D)) * valid
+    backward = jax.jit(
+        jax.grad(lambda p, module: (module.apply(p, *args) * weight).sum()),
+        static_argnums=1,
+    )
+    flatten = lambda g: jnp.concatenate(
+        [leaf.ravel() for leaf in jax.tree_util.tree_leaves(g)]
+    )
+    assert close(
+        flatten(backward(params, reference)), flatten(backward(params, fused))
+    )
+
+
 def test_measured_density_is_a_fraction(arm_inputs):
     """Density feeds `bdh_ideal_flops`, so it has to be a real fraction.
 

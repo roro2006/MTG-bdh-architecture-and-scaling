@@ -39,6 +39,7 @@ BDH result is measured against.
 from __future__ import annotations
 
 import functools
+import math
 
 import flax.linen as nn
 import jax
@@ -64,7 +65,7 @@ def _pow2(n: int) -> int:
 
 def _mask_fill(dtype) -> float:
     """The value flax substitutes for masked logits."""
-    return float(jnp.finfo(dtype).min)
+    return float(jnp.finfo(dtype).min)  # metadata, not a traced op
 
 
 # --------------------------------------------------------------------------
@@ -79,7 +80,7 @@ def reference_attention(
 ) -> jnp.ndarray:
     """Pure-JAX attention, matching flax's dot_product_attention, except on
     query rows with no visible key at all -- see `EMPTY_ROW_NOTE`."""
-    scale = 1.0 / jnp.sqrt(q.shape[-1]).astype(jnp.float32)
+    scale = 1.0 / math.sqrt(q.shape[-1])
     scores = jnp.einsum("bhqd,bhkd->bhqk", q, k) * scale
     scores = jnp.where(mask, scores, _mask_fill(scores.dtype))
     weights = jax.nn.softmax(scores, axis=-1)
@@ -196,7 +197,7 @@ def _attention(q, k, v, mask, interpret):
 def _attention_fwd(q, k, v, mask, interpret):
     b, h, lq, dh = q.shape
     lk = k.shape[2]
-    scale = 1.0 / float(jnp.sqrt(dh))
+    scale = 1.0 / math.sqrt(dh)
     fill = _mask_fill(q.dtype)
     q_spec, k_spec, m_spec, lse_spec = _specs(
         b, h, lq, lk, dh, mask_heads=mask.shape[1] != 1
@@ -220,7 +221,7 @@ def _attention_bwd(interpret, res, do):
     q, k, v, mask, lse = res
     b, h, lq, dh = q.shape
     lk = k.shape[2]
-    scale = 1.0 / float(jnp.sqrt(dh))
+    scale = 1.0 / math.sqrt(dh)
     fill = _mask_fill(q.dtype)
     q_spec, k_spec, m_spec, lse_spec = _specs(
         b, h, lq, lk, dh, mask_heads=mask.shape[1] != 1
