@@ -55,6 +55,25 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--pool-layers", type=int, default=2)
     parser.add_argument("--pack-layers", type=int, default=1)
     parser.add_argument("--num-heads", type=int, default=4)
+    parser.add_argument(
+        "--neuron-multiplier",
+        type=int,
+        default=4,
+        help=(
+            "BDH neuron width per head is this times width over heads. The "
+            "default makes a BDH layer iso-parameter with a cross-attention "
+            "block; the BDH paper's own default of 128 is 32x larger."
+        ),
+    )
+    parser.add_argument(
+        "--fused-kernels",
+        action="store_true",
+        help=(
+            "Run the arm through its Pallas kernel. Same parameters and same "
+            "values (tests/test_kernels.py); needs a GPU or TPU to be worth "
+            "anything, since Pallas falls back to a slow interpreter on CPU."
+        ),
+    )
     parser.add_argument("--steps", type=int, default=3000)
     parser.add_argument(
         "--epochs", type=float, default=None,
@@ -101,6 +120,8 @@ def main(argv: list[str] | None = None) -> int:
         pool_encoder_layers=args.pool_layers,
         pack_encoder_layers=args.pack_layers,
         arm_layers=args.arm_layers,
+        neuron_multiplier=args.neuron_multiplier,
+        fused_kernels=args.fused_kernels,
         card_feature_dim=table.shape[1],
     )
     steps = args.steps
@@ -140,6 +161,8 @@ def main(argv: list[str] | None = None) -> int:
 
     metrics = {
         "arm": args.arm,
+        "neuron_multiplier": args.neuron_multiplier,
+        "fused_kernels": args.fused_kernels,
         "num_params": result["num_params"],
         "param_breakdown": result["param_breakdown"],
         "train_rows": int(train_indices.size),
