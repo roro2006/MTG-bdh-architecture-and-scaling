@@ -19,6 +19,7 @@ import pytest
 from src.models.flops import (
     BACKWARD_MULTIPLIER,
     arm_flop_share,
+    bdh_ideal_flops,
     count_flops_analytic,
     flops_per_step,
     measure_flops_xla,
@@ -125,12 +126,51 @@ def test_arm_share_is_a_minority_of_the_budget_by_default(model_config):
     assert deeper > share
 
 
-def test_bdh_arm_has_no_derivation_yet(model_config):
+def test_bdh_arm_is_counted_separately_from_attention(model_config):
     """It must not silently inherit the attention arm's count: BDH's whole
-    claim is that it does less arithmetic per weight.
+    claim is that it does different arithmetic per weight.
     """
-    with pytest.raises(NotImplementedError, match="sparsity"):
-        count_flops_analytic(model_config(64), arm="bdh")
+    config = model_config(256)
+    attention = count_flops_analytic(config, arm="attention")
+    bdh = count_flops_analytic(config, arm="bdh")
+
+    assert bdh["arm"] != attention["arm"]
+    # Everything outside the arm is the shared front-end and must be
+    # untouched by which arm is selected -- that is the premise of the whole
+    # comparison.
+    for component in ("card_embedding", "pack_encoder", "pool_encoder", "pointer"):
+        assert bdh[component] == attention[component]
+
+
+def test_bdh_ideal_flops_are_bounded_by_the_unskippable_encodes(model_config):
+    """Sparsity cannot make BDH free, and the accounting has to show why.
+
+    Only the score and decode reductions shrink with density. The three
+    D->N encodes are paid in full at any density, because a ReLU's output
+    is not known until its input has been computed. So the ideal count has
+    a floor well above zero, and reporting an iso-FLOP comparison as though
+    it did not is the exact error the fairness note warns about.
+    """
+    config = model_config(256)
+    dense = bdh_ideal_flops(config, score_density=1.0, gate_density=1.0)
+    assert dense["total"] == pytest.approx(dense["dense_total"])
+
+    vanishing = bdh_ideal_flops(config, score_density=0.0, gate_density=0.0)
+    assert vanishing["scores"] == 0.0
+    assert vanishing["decode"] == 0.0
+    # Even with every neuron dead, the encodes survive and dominate.
+    assert vanishing["total"] > 0.5 * dense["dense_total"]
+
+    sparse = bdh_ideal_flops(config, score_density=0.05, gate_density=0.05)
+    assert vanishing["total"] < sparse["total"] < dense["total"]
+
+
+@pytest.mark.parametrize("bad", [-0.1, 1.5])
+def test_bdh_ideal_flops_rejects_impossible_densities(model_config, bad):
+    """A density outside [0, 1] means the measurement is wrong; silently
+    scaling by it would produce a plausible number from a broken input."""
+    with pytest.raises(ValueError, match="fraction"):
+        bdh_ideal_flops(model_config(64), score_density=bad, gate_density=0.5)
 
 
 def test_feature_dim_enters_only_through_the_embedding(model_config):

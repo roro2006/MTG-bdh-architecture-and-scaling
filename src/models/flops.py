@@ -34,6 +34,7 @@ checks is a number nobody should trust.
 
 from __future__ import annotations
 
+from .bdh_arm import neuron_count
 from .pick_model import ModelConfig
 
 # Padded widths the model always computes over. These match
@@ -73,6 +74,47 @@ def _cross_attention(query_length: int, context_length: int, d: int) -> int:
 
 def _mlp(tokens: int, d: int, ratio: int) -> int:
     return _dense(tokens, d, ratio * d) + _dense(tokens, ratio * d, d)
+
+
+def _bdh_layer(
+    query_length: int, context_length: int, d: int, nh: int, n: int
+) -> dict[str, int]:
+    """One BDH layer, split by whether activation sparsity can skip it.
+
+    The split is the whole point. Three of these terms are *not* skippable
+    however sparse the model gets:
+
+      - the encodes produce the activations. You cannot know a ReLU is
+        going to output zero without computing the pre-activation, so the
+        D->N matmuls are paid in full no matter what the density is.
+      - the value matmul consumes the scores, which are dense in shape even
+        when the neurons behind them are not.
+
+    Two are skippable in principle:
+
+      - the scores reduce over N, and only neurons active in *both* the
+        query and the key contribute, so the reduction shrinks with the
+        joint density;
+      - the decode reduces over nh*N against the gated activations, which
+        are the sparsest tensor in the block.
+
+    So even a perfectly sparsity-exploiting BDH does not get cheap: the
+    encodes alone are 3 * nh * L * D * N. `bdh_ideal_flops` puts a number
+    on the ceiling.
+    """
+    return {
+        "encode_q": nh * _matmul(query_length, d, n),
+        "encode_k": nh * _matmul(context_length, d, n),
+        "encode_v": nh * _matmul(query_length, d, n),
+        "scores": nh * _matmul(query_length, n, context_length),
+        "values": nh * _matmul(query_length, context_length, d),
+        "decode": _matmul(query_length, nh * n, d),
+    }
+
+
+# Terms `_bdh_layer` produces that activation sparsity could skip, and the
+# density each one scales with.
+BDH_SKIPPABLE = {"scores": "score", "decode": "gate"}
 
 
 def count_flops_analytic(
@@ -119,11 +161,18 @@ def count_flops_analytic(
         context_length = max_pool + 1
         per_layer = _cross_attention(max_pack, context_length, d) + _mlp(max_pack, d, r)
         counts["arm"] = float(config.arm_layers * per_layer)
-    else:
-        raise NotImplementedError(
-            f"no analytic FLOP derivation for arm {arm!r}; the BDH arm's count "
-            "has to account for its activation sparsity explicitly"
+    elif arm == "bdh":
+        # The dense count: the arithmetic the hardware actually performs.
+        # A GPU multiplies by a zero exactly as fast as by anything else,
+        # so this is the honest number for a wall-clock or realised-FLOP
+        # comparison. `bdh_ideal_flops` gives the sparsity-skipping bound.
+        n = neuron_count(d, config.num_heads, config.neuron_multiplier)
+        per_layer = sum(
+            _bdh_layer(max_pack, max_pool, d, config.num_heads, n).values()
         )
+        counts["arm"] = float(config.arm_layers * per_layer)
+    else:
+        raise NotImplementedError(f"no analytic FLOP derivation for arm {arm!r}")
 
     total = sum(counts.values())
     if include_backward:
@@ -211,3 +260,47 @@ def measure_flops_xla(
         analysis = analysis[0]
     flops = analysis.get("flops")
     return None if flops is None else float(flops) / batch_size
+
+
+def bdh_ideal_flops(
+    config: ModelConfig,
+    *,
+    score_density: float,
+    gate_density: float,
+    max_pack: int = DEFAULT_MAX_PACK,
+    max_pool: int = DEFAULT_MAX_POOL,
+) -> dict[str, float]:
+    """BDH arm FLOPs if every zero activation were skipped for free.
+
+    This is a *bound*, not a measurement, and the gap between it and
+    `count_flops_analytic` is the thing the fairness note in
+    docs/ARCHITECTURE.md is really about. Dense hardware realises none of
+    it: unstructured zeros still occupy a lane in a tensor-core tile.
+    Reaching this bound needs block-structured sparsity, which is a change
+    to the architecture rather than to the kernels.
+
+    Densities are empirical. Get them from
+    `src/models/bdh_arm.py::measure_density` on a real batch of the model
+    you are actually reporting; do not assume the value at initialisation,
+    which is 0.5 by construction and has nothing to do with the trained
+    model.
+
+    Returns the per-term breakdown plus "total" and "dense_total", so the
+    caller can see which terms the saving came from.
+    """
+    for name, value in (("score_density", score_density), ("gate_density", gate_density)):
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"{name} must be a fraction in [0, 1], got {value}")
+
+    d = config.hidden_dim
+    n = neuron_count(d, config.num_heads, config.neuron_multiplier)
+    densities = {"score": score_density, "gate": gate_density}
+
+    terms = _bdh_layer(max_pack, max_pool, d, config.num_heads, n)
+    scaled = {
+        name: float(config.arm_layers * cost * densities.get(BDH_SKIPPABLE.get(name), 1.0))
+        for name, cost in terms.items()
+    }
+    scaled["total"] = sum(scaled.values())
+    scaled["dense_total"] = float(config.arm_layers * sum(terms.values()))
+    return scaled
