@@ -378,3 +378,34 @@ def test_count_params_actual_ignores_non_parameter_collections(feature_table):
     # A bare params tree, which is what a restored checkpoint hands back,
     # has to count the same.
     assert count_params_actual(variables["params"]) == expected
+
+
+def test_a_forced_pick_contributes_no_gradient(feature_table, rng):
+    """The premise behind dropping forced rows from training.
+
+    A one-card pack has exactly one admissible answer, so its loss is zero
+    whatever the parameters are -- and a loss that is constant in the
+    parameters has zero derivative with respect to all of them. That is
+    what makes dropping these rows free rather than a trade: they are not
+    cheap signal, they are no signal.
+
+    Asserted on the gradient rather than on the loss, because a zero loss
+    would also be produced by a model that had merely learned these rows,
+    and only the gradient distinguishes "already fitted" from "unfittable".
+    """
+    model, params = init_model(_config(), feature_table, arm="bdh", seed=0)
+    batch = _batch(rng, batch_size=4, pack_sizes=[1, 1, 1, 1])
+
+    def loss_fn(p):
+        logits = model.apply(
+            p, feature_table,
+            jnp.asarray(batch["pack_ids"]), jnp.asarray(batch["pool_ids"]),
+            jnp.asarray(batch["pack_number"]), jnp.asarray(batch["pick_number"]),
+        )
+        return cross_entropy_loss(logits, jnp.zeros(4, dtype=jnp.int32))[0]
+
+    assert float(loss_fn(params)) == pytest.approx(0.0, abs=1e-6)
+    grads = jax.tree_util.tree_leaves(jax.grad(loss_fn)(params))
+    assert grads
+    worst = max(float(jnp.abs(g).max()) for g in grads)
+    assert worst == pytest.approx(0.0, abs=1e-9), f"largest |grad| was {worst}"

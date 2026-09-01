@@ -38,6 +38,7 @@ docs/
   ARCHITECTURE.md     — the card/pack/pool encoder design and how BDH plugs into it
   DATA.md             — what data sources are used, what was verified, and why
   RESULTS.md          — measured numbers, and what they do and do not license
+  COLAB.md            — how the grid is made to fit a free Colab session
 src/
   data/               — dataset pipeline (17lands ingestion, vocab construction)
   models/             — the shared front-end, the attention arm, the BDH arm
