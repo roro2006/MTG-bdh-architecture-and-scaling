@@ -123,6 +123,11 @@ def main(argv: list[str] | None = None) -> int:
         neuron_multiplier=args.neuron_multiplier,
         fused_kernels=args.fused_kernels,
         card_feature_dim=table.shape[1],
+        # Same pattern as card_feature_dim: shapes fixed by the corpus are
+        # read off the corpus. These size the two ContextFeatures embeddings,
+        # so a set with a different pack geometry would index out of range.
+        packs_per_draft=data.packs_per_draft,
+        picks_per_pack=data.picks_per_pack,
     )
     steps = args.steps
     if args.epochs is not None:
