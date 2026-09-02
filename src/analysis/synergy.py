@@ -470,10 +470,11 @@ def synergy_summary(
 
     This is the whole reason the probe exists. "The pool is red, so take the
     red card" produces a large lift and is not synergy in the sense the
-    mechanical feature columns were added for. If essentially all of the
-    lift sits in the colour-sharing half, the model has learned colour
-    matching and nothing more; a comparable effect in the colour-disjoint
-    half is the part worth chasing into the mechanic columns.
+    mechanical feature columns were added for. Read `colour_gap` for how
+    much sharing a colour is worth on its own, and `within_colour_spread`
+    for whether the model distinguishes *which* same-colour card is in the
+    pool -- the latter is where card-level synergy lives, and a pure colour
+    matcher has almost none of it.
 
     Colourless cards are excluded from both halves rather than assigned to
     one: they match every colour trivially, and counting them either way
@@ -490,20 +491,37 @@ def synergy_summary(
 
     same = lift[shares & colored]
     different = lift[(~shares) & colored]
+
+    def _mean(values):
+        return float(values.mean()) if values.size else float("nan")
+
+    def _std(values):
+        return float(values.std()) if values.size else float("nan")
+
+    # Two numbers, read together, and neither is a ratio -- a ratio of
+    # magnitudes hides the sign, and the sign is the whole finding. A model
+    # trained on FIN puts mean_lift_cross_colour at about -0.6: a candidate
+    # that shares no colour with the pool is actively *penalised*. That is
+    # colour matching, not synergy, however large the effect looks.
+    #
+    #   colour_gap          -- nats explained purely by sharing a colour.
+    #   within_colour_spread -- variation *among* colour-matched pairs. This
+    #     is where card-level synergy has to show up if it exists at all: a
+    #     pure colour matcher treats every same-colour anchor alike and has
+    #     a spread near zero, so a large spread here is the part of the pool
+    #     effect that colour cannot account for.
     return {
         "pairs": int(lift.size),
         "same_colour_pairs": int(same.size),
         "cross_colour_pairs": int(different.size),
-        "mean_lift_same_colour": float(same.mean()) if same.size else float("nan"),
-        "mean_lift_cross_colour": float(different.mean()) if different.size else float("nan"),
-        "std_lift_cross_colour": float(different.std()) if different.size else float("nan"),
-        # How much of the pool effect is *not* explained by colour. Near 0
-        # means colour matching accounts for the model's use of the pool.
-        "cross_colour_share": (
-            float(np.abs(different).mean() / (np.abs(same).mean() + 1e-9))
-            if same.size and different.size
+        "mean_lift_same_colour": _mean(same),
+        "mean_lift_cross_colour": _mean(different),
+        "colour_gap": (
+            _mean(same) - _mean(different) if same.size and different.size
             else float("nan")
         ),
+        "within_colour_spread": _std(same),
+        "cross_colour_spread": _std(different),
     }
 
 
