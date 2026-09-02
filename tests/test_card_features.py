@@ -378,6 +378,62 @@ def test_save_and_load_round_trips(small_features, tmp_path):
     assert reloaded.mechanic_names == MECHANIC_NAMES
 
 
+def test_split_card_names_are_retried_by_front_face(monkeypatch):
+    """17lands names a split or Room card "Front // Back", and Scryfall's
+    /cards/collection refuses that exact string -- verified live: it returns
+    "Crime // Punishment" in not_found but resolves "Crime" fine.
+
+    Without the retry, DSK loses 23 of its 286 cards to all-zero rows.
+    """
+    from src.data import card_features as cf
+
+    calls = []
+
+    def fake_post(url, payload):
+        asked = [i["name"] for i in payload["identifiers"]]
+        calls.append(asked)
+        data, not_found = [], []
+        for name in asked:
+            if " // " in name:            # the real endpoint's behaviour
+                not_found.append({"name": name})
+            elif name == "Bottomless Pool":
+                data.append({"name": "Bottomless Pool // Locker Room"})
+            elif name == "Grizzly Bears":
+                data.append({"name": "Grizzly Bears"})
+            else:
+                not_found.append({"name": name})
+        return {"data": data, "not_found": not_found}
+
+    monkeypatch.setattr(cf, "_post_json", fake_post)
+    monkeypatch.setattr(cf.time, "sleep", lambda _: None)
+
+    found, missing = cf.fetch_scryfall_cards(
+        ["Grizzly Bears", "Bottomless Pool // Locker Room"]
+    )
+    assert missing == []
+    # Keyed by the name the caller asked for, so vocabulary ids still line up.
+    assert found["Bottomless Pool // Locker Room"]["name"] == (
+        "Bottomless Pool // Locker Room"
+    )
+    # The retry only asks about the names that actually failed.
+    assert calls[-1] == ["Bottomless Pool"]
+
+
+def test_a_genuinely_unknown_name_is_still_reported_missing(monkeypatch):
+    from src.data import card_features as cf
+
+    monkeypatch.setattr(
+        cf, "_post_json",
+        lambda url, payload: {
+            "data": [], "not_found": [{"name": i["name"]} for i in payload["identifiers"]]
+        },
+    )
+    monkeypatch.setattr(cf.time, "sleep", lambda _: None)
+    found, missing = cf.fetch_scryfall_cards(["No Such Card", "Also // Not Real"])
+    assert found == {}
+    assert missing == ["Also // Not Real", "No Such Card"]
+
+
 def test_loading_a_pre_rewrite_table_is_refused(tmp_path):
     """An old npz has keyword columns fitted to one set. Silently accepting
     it would train a model on columns whose meaning nobody can recover.
