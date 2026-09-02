@@ -92,12 +92,31 @@ def _features_populated(ctx) -> CheckResult:
     )
     # Colourless zero-cost non-typed cards do not exist, so this really is
     # the unresolved signature.
-    if empty.size:
-        names = [features.card_names[i] for i in empty[:5]]
+    if not empty.size:
         return CheckResult(
-            "", False, f"{empty.size} cards have no attributes at all, e.g. {names}"
+            "", True, f"{dense.shape[0]} cards x {dense.shape[1]} dims, all populated"
         )
-    return CheckResult("", True, f"{dense.shape[0]} cards x {dense.shape[1]} dims, all populated")
+
+    names = [features.card_names[i] for i in empty[:5]]
+    fraction = empty.size / max(dense.shape[0], 1)
+    detail = (
+        f"{empty.size} of {dense.shape[0]} cards have no attributes at all "
+        f"({fraction:.1%}), e.g. {names}"
+    )
+    # A systematic miss is a bug and must fail: DSK's 23 Room cards were
+    # unresolved because /cards/collection refuses the "Front // Back" name
+    # that 17lands uses. A couple of cards is a genuine gap in the source --
+    # HBG's Alchemy rebalances (the "A-" prefix) are not on Scryfall at all,
+    # and substituting the paper card would fabricate precisely what the
+    # rebalance changed. Those stay as neutral zero rows and are reported,
+    # because a gate that can never pass on a set trains people to ignore it.
+    if fraction > 0.02:
+        return CheckResult("", False, detail + " -- too many to be a source gap")
+    return CheckResult(
+        "", True,
+        f"{dense.shape[0] - empty.size} of {dense.shape[0]} cards populated; "
+        + detail + ", left as neutral zero rows",
+    )
 
 
 @check("the feature layout is the same for every set")
@@ -196,16 +215,30 @@ def _pack_sizes(ctx) -> CheckResult:
     picks_per_pack = data.geometry.picks_per_pack
 
     expected = picks_per_pack - data.pick_number
-    bad = int((data.pack_size != expected).sum())
-    if bad:
-        sample = np.flatnonzero(data.pack_size != expected)[:3]
+    mismatched = np.flatnonzero(data.pack_size != expected)
+    bad = int(mismatched.size)
+    if not bad:
         return CheckResult(
-            "", False,
-            f"{bad:,} rows disagree, e.g. rows {sample.tolist()} "
-            f"(sizes {data.pack_size[sample].tolist()})",
+            "", True, f"pack_size == {picks_per_pack} - pick_number everywhere"
         )
+
+    # A handful of odd packs is corpus noise, not a geometry error: SIR has
+    # two rows in 2.15M where a pack is short of what its pick number
+    # predicts. Failing on those would mean this gate can never pass on SIR,
+    # which trains the habit of ignoring it. A systematic disagreement --
+    # anything above a rounding-error fraction -- still fails, because that
+    # is what a wrong picks_per_pack looks like.
+    fraction = bad / max(data.size, 1)
+    detail = (
+        f"{bad:,} of {data.size:,} rows ({fraction:.4%}) disagree, e.g. rows "
+        f"{mismatched[:3].tolist()} (sizes {data.pack_size[mismatched[:3]].tolist()})"
+    )
+    if fraction > 1e-4:
+        return CheckResult("", False, detail + " -- too many to be corpus noise")
     return CheckResult(
-        "", True, f"pack_size == {picks_per_pack} - pick_number everywhere"
+        "", True,
+        f"pack_size == {picks_per_pack} - pick_number on {1 - fraction:.4%} of rows; "
+        + detail,
     )
 
 

@@ -682,8 +682,30 @@ def fetch_scryfall_cards(card_names: list[str]) -> tuple[dict[str, dict], list[s
                 found[name] = card
                 break
 
+    # Split, transforming and Room cards: 17lands names them with the full
+    # "Front // Back", and /cards/collection refuses that exact string --
+    # verified against the live endpoint, which returns "Crime // Punishment"
+    # in `not_found` but resolves it fine when asked for "Crime". The pass
+    # above only covers the opposite case (17lands gives the front face,
+    # Scryfall answers with the full name), so without this retry DSK loses
+    # 23 of its 286 cards to all-zero feature rows.
+    retry = [n for n in card_names if n not in found and " // " in n]
+    for start in range(0, len(retry), BATCH_SIZE):
+        batch = retry[start : start + BATCH_SIZE]
+        payload = {"identifiers": [{"name": n.split(" // ")[0]} for n in batch]}
+        try:
+            response = _post_json(SCRYFALL_COLLECTION_URL, payload)
+        except urllib.error.HTTPError:
+            break
+        by_front = {c["name"].split(" // ")[0]: c for c in response.get("data", [])}
+        for name in batch:
+            card = by_front.get(name.split(" // ")[0])
+            if card is not None:
+                found[name] = card
+        time.sleep(REQUEST_DELAY_S)
+
     still_missing = [n for n in card_names if n not in found]
-    return found, sorted(set(missing) | set(still_missing))
+    return found, sorted(still_missing)
 
 
 def _front_face(card: dict) -> dict:
