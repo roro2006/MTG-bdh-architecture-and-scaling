@@ -332,27 +332,58 @@ def test_synergy_summary_splits_on_colour_and_ignores_colourless():
     assert summary["pairs"] == 6
 
 
-def test_synergy_summary_flags_a_pure_colour_matcher():
-    """A model whose whole pool effect is colour should report a
-    cross-colour share near zero -- that is the read that says "this is
-    colour matching, not synergy"."""
+def _four_colour_features():
     names = ("Red One", "Blue One", "Red Two", "Blue Two")
     vocab = Vocabulary(card_to_id={n: i for i, n in enumerate(names)}, id_to_card=names)
     cards = {
         "Red One": _card("Red One", ["R"]), "Red Two": _card("Red Two", ["R"]),
         "Blue One": _card("Blue One", ["U"]), "Blue Two": _card("Blue Two", ["U"]),
     }
-    features = build_features(vocab, cards)
-    candidates, anchors = [0, 1], [2, 3]
-    colour_only = np.array([[3.0, 0.0], [0.0, 3.0]])
-    assert synergy_summary(None, features, colour_only, candidates, anchors)[
-        "cross_colour_share"
-    ] == pytest.approx(0.0, abs=1e-6)
+    return build_features(vocab, cards), [0, 1], [2, 3]
 
+
+def test_a_pure_colour_matcher_shows_a_gap_and_no_within_colour_spread():
+    """The read that says "colour matching, not synergy": all of the lift is
+    explained by sharing a colour, and the model does not distinguish which
+    same-colour card is in the pool.
+    """
+    features, candidates, anchors = _four_colour_features()
+    colour_only = np.array([[3.0, 0.0], [0.0, 3.0]])
+    summary = synergy_summary(None, features, colour_only, candidates, anchors)
+    assert summary["colour_gap"] == pytest.approx(3.0)
+    assert summary["within_colour_spread"] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_a_model_that_is_indifferent_to_colour_shows_no_gap():
+    features, candidates, anchors = _four_colour_features()
     even = np.array([[3.0, 3.0], [3.0, 3.0]])
-    assert synergy_summary(None, features, even, candidates, anchors)[
-        "cross_colour_share"
-    ] == pytest.approx(1.0, rel=1e-4)
+    summary = synergy_summary(None, features, even, candidates, anchors)
+    assert summary["colour_gap"] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_card_level_synergy_shows_up_as_within_colour_spread():
+    """Two same-colour anchors that the model treats differently is exactly
+    the signal colour cannot explain, and it must survive the split.
+    """
+    features, candidates, anchors = _four_colour_features()
+    # Candidate 0 (red) loves red anchor 2; candidate 1 (blue) is lukewarm
+    # about blue anchor 3. Same colour relationship, different magnitude.
+    varied = np.array([[4.0, 0.0], [0.0, 0.5]])
+    summary = synergy_summary(None, features, varied, candidates, anchors)
+    assert summary["within_colour_spread"] > 1.0
+    assert summary["mean_lift_cross_colour"] == pytest.approx(0.0)
+
+
+def test_a_negative_cross_colour_mean_is_reported_as_negative():
+    """A ratio of magnitudes would hide this. The model penalising
+    off-colour candidates is the single most important thing the split can
+    say, so the sign has to survive into the summary.
+    """
+    features, candidates, anchors = _four_colour_features()
+    penalising = np.array([[1.0, -2.0], [-2.0, 1.0]])
+    summary = synergy_summary(None, features, penalising, candidates, anchors)
+    assert summary["mean_lift_cross_colour"] == pytest.approx(-2.0)
+    assert summary["colour_gap"] == pytest.approx(3.0)
 
 
 def test_strongest_pairs_reports_names_in_descending_order(corpus):
