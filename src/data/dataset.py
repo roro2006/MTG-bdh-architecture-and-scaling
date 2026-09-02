@@ -104,6 +104,7 @@ class PickData:
         vocab: Vocabulary,
         on_invalid: str = "drop",
         geometry: PackGeometry | None = None,
+        max_dropped_fraction: float = 0.5,
     ):
         if on_invalid not in ("drop", "raise"):
             raise ValueError(f"on_invalid must be 'drop' or 'raise', got {on_invalid!r}")
@@ -148,13 +149,49 @@ class PickData:
                     f"first is {self.draft_ids[bad_drafts[0]]}. Pass on_invalid='drop' "
                     "to exclude them."
                 )
+            rows_before = int(self.draft_idx.size)
             keep = ~np.isin(self.draft_idx, bad_drafts)
             self.dropped_rows = int((~keep).sum())
+            if self.dropped_rows > max_dropped_fraction * max(rows_before, 1):
+                raise ValueError(self._mass_drop_diagnosis(bad_drafts, rows_before))
             for field in self._FIELDS:
                 setattr(self, field, getattr(self, field)[keep])
             self._reindex()
             if self._invalid_drafts().size:
                 raise AssertionError("dropping invalid drafts did not restore the identity")
+
+    def _mass_drop_diagnosis(self, bad_drafts: np.ndarray, rows_before: int) -> str:
+        """Says *why* a corpus is about to disappear, rather than emptying it.
+
+        Dropping a few malformed drafts is routine. Dropping most of them
+        means the corpus does not have the shape this loader believes it
+        has, and the default `on_invalid="drop"` would otherwise hand back
+        an empty PickData with no explanation -- the exact silent failure
+        the geometry work exists to prevent.
+
+        The single most useful fact is the modal number of rows per draft:
+        AFR.PremierDraft has 41 where 3x14 predicts 42, because its export
+        omits every draft's very first pick.
+        """
+        counts = np.bincount(self.draft_idx, minlength=self.n_drafts)
+        counts = counts[counts > 0]
+        modal = int(np.bincount(counts).argmax()) if counts.size else 0
+        expected = self.geometry.picks_per_draft
+        note = ""
+        if modal and modal != expected:
+            note = (
+                f" Most drafts have {modal} rows where this geometry predicts "
+                f"{expected}; the export is probably missing "
+                f"{expected - modal} pick(s) per draft rather than being "
+                "the geometry recorded."
+            )
+        return (
+            f"{self.dropped_rows:,} of {rows_before:,} rows "
+            f"({self.dropped_rows / max(rows_before, 1):.1%}) belong to drafts that "
+            f"violate the pool-as-prefix identity at geometry "
+            f"{self.geometry.describe()}.{note} Refusing to return a corpus that "
+            "is mostly gone -- pass max_dropped_fraction=1.0 to accept it anyway."
+        )
 
     def _reindex(self) -> None:
         """First row of each draft, for the pool-as-prefix slice."""
@@ -179,7 +216,12 @@ class PickData:
         return self.geometry.max_pool_size
 
     @classmethod
-    def load(cls, processed_dir: str | Path, on_invalid: str = "drop") -> "PickData":
+    def load(
+        cls,
+        processed_dir: str | Path,
+        on_invalid: str = "drop",
+        max_dropped_fraction: float = 0.5,
+    ) -> "PickData":
         """Loads a processed directory, taking its geometry from
         ingest_stats.json when that file records one.
         """
@@ -192,6 +234,7 @@ class PickData:
             vocab,
             on_invalid=on_invalid,
             geometry=load_geometry(processed_dir),
+            max_dropped_fraction=max_dropped_fraction,
         )
 
     def _invalid_drafts(self) -> np.ndarray:

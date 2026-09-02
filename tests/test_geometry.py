@@ -84,10 +84,18 @@ def test_a_non_default_corpus_survives_the_prefix_identity(odd_geometry_corpus):
     assert PickData.load(out, on_invalid="raise").size == data.size
 
     # ...and the counterfactual, which is what the old hardcoded constants
-    # produced: force the default 3 x 14 onto this corpus and it vanishes.
+    # produced: force the default 3 x 14 onto this corpus and every draft
+    # fails the identity. That now raises with a diagnosis rather than
+    # handing back an empty corpus, which is the failure mode that cost a
+    # real set (AFR) an afternoon to track down.
     with np.load(out / "picks.npz") as handle:
         arrays = {name: handle[name] for name in handle.files}
-    forced = PickData(arrays, data.vocab, geometry=DEFAULT_GEOMETRY)
+    with pytest.raises(ValueError, match="Most drafts have"):
+        PickData(arrays, data.vocab, geometry=DEFAULT_GEOMETRY)
+
+    forced = PickData(
+        arrays, data.vocab, geometry=DEFAULT_GEOMETRY, max_dropped_fraction=1.0
+    )
     assert forced.size == 0
     assert forced.dropped_drafts == len(drafts)
 

@@ -35,15 +35,28 @@ COLUMNS = (
 )
 
 
-def write_export(path, drafts, gzipped: bool = True) -> None:
+def write_export(path, drafts, gzipped: bool = True, drop_columns=()) -> None:
     """Writes a format-faithful draft_data_public CSV.
 
     `drafts` is a list of (draft_id, packs), where packs holds
     PACKS_PER_DRAFT lists of card names in the order that drafter took them.
+
+    `drop_columns` omits named metadata columns, because the real exports
+    disagree about which ones they carry: AFR.PremierDraft has no `rank`
+    and no `user_game_win_rate_bucket` at all.
     """
+    drop = set(drop_columns)
+    keep = [i for i, c in enumerate(COLUMNS) if c not in drop]
+
     opener = gzip.open if gzipped else open
     with opener(path, "wt", encoding="utf-8", newline="") as handle:
-        writer = csv.writer(handle)
+        raw = csv.writer(handle)
+
+        class _RowWriter:
+            def writerow(self, row):
+                raw.writerow(row if not drop else [row[i] for i in keep])
+
+        writer = _RowWriter()
         writer.writerow(COLUMNS)
         for draft_id, packs in drafts:
             pool: list[str] = []
