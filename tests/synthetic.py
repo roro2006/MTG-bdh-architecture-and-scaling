@@ -66,17 +66,37 @@ def write_export(path, drafts, gzipped: bool = True) -> None:
                     pool.append(taken[pick_number])
 
 
-def make_draft(rng, draft_id: str):
-    """One well-formed draft: three packs of PICKS_PER_PACK distinct cards."""
+def make_draft(
+    rng,
+    draft_id: str,
+    picks_per_pack: int = PICKS_PER_PACK,
+    packs_per_draft: int = PACKS_PER_DRAFT,
+):
+    """One well-formed draft: `packs_per_draft` packs of distinct cards.
+
+    The geometry is a parameter rather than a constant because the ingest
+    pass is supposed to measure it instead of assuming Arena's usual 3x14
+    -- see src/data/ingest.py::PackGeometry. A test that can only build
+    3x14 exports cannot tell a working detector from a hardcoded 14.
+    """
     packs = [
-        list(rng.choice(CARDS, size=PICKS_PER_PACK, replace=False))
-        for _ in range(PACKS_PER_DRAFT)
+        list(rng.choice(CARDS, size=picks_per_pack, replace=False))
+        for _ in range(packs_per_draft)
     ]
     return (draft_id, packs)
 
 
-def make_drafts(rng, count: int, prefix: str = "draft"):
-    return [make_draft(rng, f"{prefix}{i:04d}") for i in range(count)]
+def make_drafts(
+    rng,
+    count: int,
+    prefix: str = "draft",
+    picks_per_pack: int = PICKS_PER_PACK,
+    packs_per_draft: int = PACKS_PER_DRAFT,
+):
+    return [
+        make_draft(rng, f"{prefix}{i:04d}", picks_per_pack, packs_per_draft)
+        for i in range(count)
+    ]
 
 
 def make_matched_pair(rng):
