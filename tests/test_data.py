@@ -163,9 +163,8 @@ def test_split_keeps_every_pick_of_a_draft_together(corpus):
 
 
 def test_matched_states_are_found_across_distinct_drafts(tmp_path):
-    """Two drafters facing the same pack with the same pool is the whole
-    input to the Bayes-floor measurement, so grouping them is tested on a
-    case constructed to contain exactly one such recurrence.
+    """Grouping two drafters who faced the same pack with the same pool is
+    tested on a case constructed to contain exactly one such recurrence.
     """
     rng = np.random.default_rng(3)
     _, packs_a = _draft(rng, "a")

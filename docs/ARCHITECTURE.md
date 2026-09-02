@@ -2,49 +2,74 @@
 
 ## Why not a plain causal transformer
 
-The obvious first move is to treat a draft like a sentence — feed the sequence of picks into a GPT-style causal block and predict the next one. That's the wrong shape for this problem, and not just as a style preference: within a single pack, and within the pool accumulated so far, order carries no information. A pack is a set of fifteen (or fewer) cards; whatever order the data pipeline happens to list them in is arbitrary. A causal transformer with positional encoding has no way to know that and will spend real capacity learning to ignore a signal that was never there. The architecture should be structurally incapable of using pack/pool order, not merely trained to ignore it.
+The obvious first move is to treat a draft like a sentence — feed the sequence of picks into a GPT-style causal block and predict the next one. That is the wrong shape for this problem, and not just as a style preference: within a single pack, and within the pool accumulated so far, order carries no information. A pack is a set of fourteen (or fewer) cards; whatever order the data pipeline happens to list them in is arbitrary. A causal transformer with positional encoding has no way to know that and will spend real capacity learning to ignore a signal that was never there. The architecture should be structurally incapable of using pack/pool order, not merely trained to ignore it.
 
-There's a second issue with the sentence framing: a draft's entire history up to pick $t$ is already summarized by the pool at pick $t$. There's nothing left to recover by re-attending over raw pick history the way a language model re-attends over a token stream — the sufficient statistic is handed to the model directly at every step. Treating the draft as a long sequence to attend over is redundant work in exchange for nothing.
+There is a second issue with the sentence framing: a draft's entire history up to pick $t$ is already summarised by the pool at pick $t$. There is nothing left to recover by re-attending over raw pick history the way a language model re-attends over a token stream — the sufficient statistic is handed to the model directly at every step. Treating the draft as a long sequence to attend over is redundant work in exchange for nothing.
 
-## The shared front-end
+## The shared front end
 
-Both architectures in this project — the attention arm and the BDH arm — sit behind the same input pipeline, so that whatever difference shows up in the scaling curves is attributable to the interaction mechanism and nothing upstream of it.
+Both interaction arms sit behind the same input pipeline, so that whatever difference shows up between them is attributable to the mechanism and nothing upstream of it.
 
-**Composite card embeddings.** Each card's vector is built from its actual attributes rather than being one opaque row in a lookup table keyed by an arbitrary ID: color identity (5-dim multi-hot), mana value, card type, and a small embedding derived from oracle-text keywords, summed or concatenated into one vector. Two consequences follow from this, and both matter for the project's goals rather than being incidental:
+### Cards are represented by behaviour, not identity
 
-- A card released after training gets a reasonable embedding immediately, from its attributes, instead of needing a new vocabulary slot and retraining. An ID-embedding table can't do this at all.
-- Color, cost, type, and keyword text are handed to the model for free. Whatever internal structure the model still has to build in order to improve its predictions is, by construction, the part that isn't explained by those trivial features — which is exactly the residual a later interpretability pass over "why does the model think these two cards go together" needs to be looking at.
+Each card's vector is built from its actual attributes rather than being one opaque row in a lookup table keyed by an arbitrary ID:
 
-**Permutation-invariant set encoding.** Pack and pool are each run through a Set Transformer-style encoder — attention blocks with no positional encoding, pooled into a single representation per set (Lee et al., 2019's induced-set-attention approach is the natural fit here, though plain sum/mean pooling after a shared per-card MLP is a reasonable simpler baseline to start from). No position, no order, nothing for the architecture to overfit to.
+- **Set-independent attributes** — colour identity, castable colours, mana value, type flags, rarity, power/toughness, `is_creature`.
+- **A fixed global keyword vocabulary** — a checked-in constant list covering evergreen mechanics, identical for every set.
+- **Structured mechanical features derived from oracle text** — roughly 80 columns pattern-matched over Scryfall's rules text: creates tokens, sacrifice outlet, cares about creatures dying, +1/+1 counters, graveyard recursion, discard, artifacts matter, removal, ramp, and so on.
 
-**Cross-attention between pool and pack.** The decision at each pick is "given what I already have, which of these options fits" — pool as context, each pack card as a query (or the reverse), producing a per-candidate compatibility score. Pack/pick number is folded in here as a small learned feature on the query side, not as a causal position.
+Three consequences follow, and all three are load-bearing rather than incidental:
 
-**Pointer-network output.** The model scores only the cards physically present in the current pack and takes a softmax over just those scores. It is structurally unable to "pick" a card outside the pack — the same guarantee against hallucinating a nonexistent choice that the original addition-transformer exercise got from constraining its vocabulary to digits, just arrived at through the output layer this time instead of the input.
+- **A set released after training gets a usable representation immediately**, from attributes alone. An ID-embedding table cannot do this at all, and a per-set-fitted keyword block cannot either.
+- **What a card mechanically does becomes representable.** "Sacrifices a creature" and "creates tokens" are distinct columns rather than both being invisible, which is the precondition for the model learning that they belong together.
+- **The residual is interpretable.** Colour, cost, type and mechanical behaviour are handed to the model for free, so whatever internal structure it still builds is by construction the part those features do not explain.
 
-## Where the two architectures diverge
+**Nothing is fitted per set.** An earlier version of this project derived keyword columns from the set at hand, which meant column 41 was a different keyword in a different set and a checkpoint was only meaningful with the exact table it trained against. See `PROJECT_PLAN.md` §3 for why that had to go and what replaced it.
 
-Composite embeddings, set encoding, and the pointer output head are identical between runs. The one thing that changes is the interaction mechanism sitting between the pool and pack representations:
+### Permutation-invariant set encoding
+
+Pack and pool are each run through a Set Transformer-style encoder — attention blocks with no positional encoding, pooled into a single representation per set. No position, no order, nothing for the architecture to overfit to.
+
+### Pointer-network output
+
+The model scores only the cards physically present in the current pack and takes a softmax over just those scores. It is structurally unable to "pick" a card outside the pack — the same guarantee against naming a nonexistent choice that constraining a vocabulary buys on the input side, arrived at through the output layer instead.
+
+## Where synergy lives
+
+This is the design decision the whole bot rests on, so it is worth stating plainly: **synergy cannot live in the feature table.**
+
+Synergy is a relation between two cards, and a per-card feature vector has nowhere to put a relation. What the feature table can do — and all it has to do — is make the relation *representable*: carry enough about what each card mechanically does that a learned bilinear map can recover the interaction.
+
+The interaction arm is where the relation is actually computed. Pack cards are queries, the pool is context, and the arm produces a per-candidate compatibility score. `W_q` and `W_k` learning to map "sacrifice outlet" in the query onto "token maker" in the key *is* a synergy measurement. Pack and pick number are folded in on the query side as a small learned feature — "how far into the draft am I" genuinely changes what a good pick looks like — not as a causal position.
+
+This is also why structured mechanical columns beat a frozen sentence embedding here. Sentence encoders are trained for semantic **similarity**; synergy is **complementarity**. "Sacrifice a creature: draw a card" and "Create two 1/1 tokens" are maximally synergistic and not similar at all, while "create two 1/1 tokens" and "create three 1/1 tokens" are similar and largely redundant. With separate columns, one weight in the bilinear form expresses the interaction; with a similarity-shaped embedding, the arm has to first undo the geometry it was handed.
+
+**Top-1 accuracy cannot tell you whether any of this worked.** A model that only learned colour-matching scores well. The probes in `src/analysis/` — hold the pack fixed and vary the pool; compare a real pool against a shuffled one — are what distinguish the two.
+
+## Where the two arms diverge
+
+Composite embeddings, set encoding and the pointer head are identical between runs. The one thing that changes is the interaction mechanism between pool and pack:
 
 - **Attention arm** — the cross-attention block described above.
-- **BDH arm** — BDH's sparse, Hebbian-plasticity block substituted in the same position, consuming the same pool/pack representations and producing the same shape of output for the pointer head to score against.
+- **BDH arm** — BDH's sparse, Hebbian-plasticity block in the same position, consuming the same pool/pack representations and producing the same shape for the pointer head.
 
-No existing JAX implementation of BDH exists; the reference implementation (`pathwaycom/bdh`) is a bare PyTorch script. The port lives in `src/models/bdh_arm.py`.
+No JAX implementation of BDH existed; the reference (`pathwaycom/bdh`) is a bare PyTorch script. The port lives in `src/models/bdh_arm.py`.
 
-**Two things in the reference had to go, and both for the reason this document already gives.** The reference is a causal language model: it applies RoPE to its query/key features and masks its scores with `tril(diagonal=-1)`. Both encode token order. A pool is a set, so there is no order for them to encode, and keeping them would have contradicted "Why not a plain causal transformer" above — the same commitment that rules out a causal transformer for the attention arm rules out a causal BDH. The port keeps everything that makes BDH BDH (the wide ReLU neuron space, the absence of a softmax, the Hebbian accumulation, the multiplicative gate, the low-rank encode/decode) and drops the two pieces that are about sequences. `tests/test_kernels.py` asserts the result is exactly invariant to permuting the pool, which is the property that would break first if order ever crept back in.
+**Two things in the reference had to go**, for the reason this document already gives. The reference is a causal language model: it applies RoPE to its query/key features and masks its scores with `tril(diagonal=-1)`. Both encode token order. A pool is a set, so there is no order for them to encode, and keeping them would have contradicted "Why not a plain causal transformer" above. The port keeps everything that makes BDH BDH — the wide ReLU neuron space, the absence of a softmax, the Hebbian accumulation, the multiplicative gate, the low-rank encode/decode — and drops the two pieces that are about sequences. `tests/test_kernels.py` asserts the result is exactly invariant to permuting the pool, which is the property that would break first if order crept back in.
 
-**Sizing had to change too.** The reference's `mlp_internal_dim_multiplier=128` gives a neuron width of `N = 32*D`, or roughly 25M parameters for one layer at `D=256` — against 0.8M for a cross-attention block. No iso-parameter grid is possible at that ratio. `neuron_multiplier=4` makes a BDH layer cost `3·m·D² = 12·D²` against a cross-attention block's `12·D² + 15·D`: iso-parameter to within a term linear in D, and 1,572,864 against 1,581,312 at `D=256` in practice — a 0.5% gap on the arm and 0.2% on the model total.
+**BDH is a candidate mechanism, not a research subject.** It ships if it drafts better. That has a concrete consequence for sizing: `neuron_multiplier` was pinned at 4 solely to make an iso-parameter comparison possible against a cross-attention block (12·D² against 12·D² + 15·D — matching to 0.5% at D=256). With the exponent comparison dropped, that constraint is gone. BDH can be sized for how well it works, and the reference's much larger neuron widths are back on the table — which is also the regime where its kernel does what it was designed to do (see below).
 
-## A fairness note for the scaling comparison
+## Compute accounting
 
-Matching the two arms on parameter count ($N$) is not the same as matching them on compute, precisely because BDH's activations are sparse by design — a forward pass can do meaningfully less arithmetic than a dense attention block with the same number of weights. Reporting only an iso-parameter curve would let "which architecture scales better" quietly mean two different things depending on which axis is held fixed. Both an iso-parameter and an iso-FLOP comparison are reported for exactly this reason — see `PROJECT_PLAN.md` §3d and §5.
+Parameter counts and FLOP counts are derived term by term (`count_params_analytic`, `src/models/flops.py`) and asserted against the realised model, rather than read off whatever the framework reports. Both numbers feed the sizing decision in `PROJECT_PLAN.md` §6, and a sizing decision made on a number nobody verified is a guess wearing a derivation's clothes.
 
-### What the FLOP accounting actually showed
+### What the FLOP accounting showed
 
-Deriving BDH's FLOP count term by term (`src/models/flops.py::_bdh_layer`) changed the picture, and the numbers below should be read before anyone writes "BDH does less arithmetic" in a results section.
+Deriving BDH's FLOP count term by term (`flops.py::_bdh_layer`) produced a result that should be read before anyone writes "BDH does less arithmetic" anywhere.
 
-**Sparsity can only skip two of the six terms.** A BDH layer spends its arithmetic on three `D → N` encodes, an interaction score, a value matmul, and an `nh·N → D` decode. Only the score and the decode reduce over the neuron axis against sparse operands, so only they shrink with density. The three encodes are paid in full at *any* density, for an unavoidable reason: you cannot know a ReLU will output zero without first computing its input. That is not an implementation limitation, it is the shape of the computation.
+**Sparsity can only skip two of six terms.** A BDH layer spends its arithmetic on three `D → N` encodes, an interaction score, a value matmul, and an `nh·N → D` decode. Only the score and the decode reduce over the neuron axis against sparse operands, so only they shrink with density. The three encodes are paid in full at *any* density, for an unavoidable reason: you cannot know a ReLU will output zero without first computing its input. That is not an implementation limitation, it is the shape of the computation.
 
-At `D=256` and the iso-parameter sizing, the consequences are stark:
+At `D=256` and iso-parameter sizing:
 
 | | forward FLOPs, arm only |
 |---|---|
@@ -53,12 +78,29 @@ At `D=256` and the iso-parameter sizing, the consequences are stark:
 | BDH arm, ideal at 25% density | 79.0M (86% of dense) |
 | BDH arm, ideal at 2% density | 75.0M (82% of dense) |
 
-So at this sizing BDH starts 53% *more* expensive than the arm it is being compared against, and perfect sparsity exploitation would claw back at most about 18%. The floor is the encodes. **A sparsity-based efficiency claim does not survive contact with this architecture at iso-parameter sizing**, and the honest iso-FLOP comparison is between the dense counts.
+So at that sizing BDH starts 53% *more* expensive than the arm beside it, and perfect sparsity exploitation would claw back at most about 18%. The floor is the encodes. **A sparsity-based efficiency claim does not survive contact with this architecture at iso-parameter sizing.** `bdh_ideal_flops` computes the bound for any measured density, and `measure_density` supplies density from a real batch rather than an assumption — at initialisation it is ~0.5, a property of the initialiser that says nothing about a trained model.
 
-That does not make the comparison uninteresting — it means the interesting question is quality per parameter and per dense FLOP, not a sparsity dividend. If a sparsity dividend is wanted, it needs either a much larger `neuron_multiplier` (where the encodes stop dominating, but iso-parameter is lost) or block-structured sparsity, which is an architectural change rather than a kernel one. `bdh_ideal_flops` computes the bound for any measured density, and `measure_density` supplies the density from a real batch rather than an assumption — at initialisation it is ~0.5, which is a property of the initialiser and says nothing about a trained model.
+## Kernel scope
 
-### Dense FLOPs are what the hardware runs
+**Attention-shaped and neuron-space operations are hand-written in Pallas. LayerNorm, Dense, softmax and elementwise ops stay in XLA**, which fuses them competently and whose gradients are not worth re-deriving to save nothing. That is the same line FlashAttention itself draws: hand-write where the memory-hierarchy decision is yours.
 
-Both arms have fused Pallas kernels (`src/models/kernels/`). They win **memory traffic**, not arithmetic: unstructured zeros still occupy a lane in a tensor-core tile, so a GPU multiplies by zero exactly as fast as by anything else. Anything reported on a wall-clock axis should say which of the two it means.
+The two arms already meet it, and they solve opposite problems. Cross-attention is small enough that a whole `(batch, head)` slice fits in SRAM — pack ≤ 14, pool ≤ 42 — so the kernel skips FlashAttention's tiling and online softmax entirely, doing forward and backward in one block each and keeping only the log-sum-exp so the backward can reconstruct the probabilities. BDH's problem is the reverse: its `(B, nh, L, N)` neuron tensors are the largest things in the model and are needed nowhere outside the block, so the neuron axis becomes a *sequential grid dimension*, tiled and accumulated in SRAM, never reaching HBM.
 
-The kernels exist for both arms deliberately. The attention arm is the control; hand-optimising only BDH would mean any wall-clock difference measured kernel effort rather than architecture.
+The backward pass is deliberately two kernels rather than one. Activation gradients and weight gradients reduce along opposite axes — `dxq` sums over heads and neuron tiles, `d_enc` sums over the batch. Doing both in one kernel would need float atomics, which accumulate in nondeterministic order, and run-to-run reproducibility is not negotiable when runs are being compared against each other. Two kernels with different grids, each reducing over a sequential axis it owns: slightly more recomputation, exactly reproducible.
+
+### The gap
+
+The commitment is not yet met. `nn.MultiHeadDotProductAttention` is still used at `set_encoder.py:49`, and the set encoders are the larger part of the model:
+
+| | share of params | share of forward FLOPs |
+|---|---|---|
+| set encoders — flax built-ins | 58% | — |
+| interaction arm — hand-written | 39% | 26% (attention) / 37% (BDH) |
+| everything outside the arm | — | 63–74% |
+
+A Pallas kernel for the set encoder's masked, position-free self-attention closes it. It is the same shape as the cross-attention kernel already written, and it is an explicit item in the build order rather than an aspiration.
+
+### Two standing caveats
+
+- **Kernels win memory traffic, not arithmetic.** Unstructured zeros still occupy a lane in a tensor-core tile, so a GPU multiplies by zero exactly as fast as by anything else. Anything reported on a wall-clock axis should say which of the two it means. Realising BDH's FLOP advantage as time needs block-structured sparsity — an architectural change, not a kernel one.
+- **They are correct but unmeasured.** Every kernel is asserted against a pure-JAX reference on values *and* on every gradient, and both fused arms against their reference arms under one shared parameter set. But `default_interpret()` returns True off GPU/TPU, and interpret mode runs kernel semantics in pure JAX with no fusion — so nothing here has a performance number attached yet. Set `KERNEL_INTERPRET=0` on real hardware to exercise the lowering.

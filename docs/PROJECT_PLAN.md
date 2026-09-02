@@ -1,97 +1,144 @@
 # Project Plan
 
-## 0. What's being tested, and what's deliberately out of scope
+## 0. What this builds, and what is out of scope
 
-The central claim under test: the scaling form
+**The deliverable is a working draft bot that can draft a set it was not trained on.** Everything else in this plan exists to produce that, or to produce it in a way that is understood rather than stumbled into.
 
-$$L(N, D) = E + \frac{A}{N^\alpha} + \frac{B}{D^\beta}$$
+Two commitments shape every stage below:
 
-is fit independently for the attention arm and the BDH arm described in `ARCHITECTURE.md`, on identical data and a shared input representation, to see whether $\alpha$ and $\beta$ hold the same values outside the open-vocabulary language modeling regime both architectures were originally validated on. A second, harder question rides along with it: whether the fitted $E$ converges toward an independently measured human disagreement rate, rather than being accepted as a free-fit constant the way it usually is.
+**Built from first principles.** The transformer front end, both interaction arms, the Pallas kernels for the attention-shaped and neuron-space operations, the parameter and FLOP accounting, and the scaling fit are all written here rather than imported. Where a library would do, the library is used only for operations whose memory behaviour is not ours to decide (LayerNorm, Dense, elementwise).
 
-This first version of the project is scoped to one set, one event type (`PremierDraft`), and the pick-prediction task alone. Multi-set transfer scaling, MoE routing scaling, and the circuit-level interpretability work that the composite-embedding design in `ARCHITECTURE.md` sets up for are all real follow-ons, but they depend on this study's trained checkpoints and shouldn't be running concurrently with it — trying to do all of it at once is the fastest way to end up with none of it done well.
+**Sized rather than guessed.** A Chinchilla-style law $L(N, D) = E + A/N^\alpha + B/D^\beta$ is fit on a cheap pilot grid, and the compute-optimal $(N^*, D^*)$ it yields is the configuration the shipped drafter is trained at. The scaling work is the sizing procedure, not a parallel research track.
 
-## 1. Task formalization
+**Out of scope for this version:** deck construction after the draft, win-rate prediction from `game_data_public`, in-draft signal reading beyond what the pool summarises, and multi-agent draft simulation. All are reasonable follow-ons; none is needed for a bot that picks well.
 
-At pick $t$: the current pack, the pool accumulated so far, and pack/pick number as scalar features, are the inputs; the label is the card the human actually took (`pick` in 17lands' `draft_data_public`). Loss is computed only over the cards physically present in the pack — never the full vocabulary — which is what makes this a genuinely closed, combinatorially bounded task rather than an open-vocabulary one wearing a small vocabulary's clothes.
+## 1. Task formalisation
 
-Splits are drawn on `draft_id`, not on individual rows. All ~45 picks belonging to one draft land in the same split. This is the same discipline as the addition-transformer exercise's train/test partition — getting it wrong here is subtler, because a leak wouldn't look like memorization of a single example, it would look like the model quietly learning something about a specific draft's trajectory that it has no business knowing at pick 3.
+At pick $t$: the current pack, the pool accumulated so far, and pack/pick number as scalar features are the inputs; the label is the card the human actually took (`pick` in 17lands' `draft_data_public`). Loss is cross-entropy computed only over the cards physically present in the pack — never the full vocabulary — which is what makes this a bounded decision task rather than an open-vocabulary one wearing a small vocabulary's clothes.
+
+Splits are drawn on `draft_id`, not on individual rows. All 42 picks belonging to one draft land in the same split. A row-level split would leak: a withheld row's label sits inside the pool of the very next pick of the same draft, so the answer arrives through the pool even though the row itself was held out.
 
 ## 2. Data
 
-Single-set `draft_data_public.<SET>.PremierDraft.csv.gz` from 17lands, vocabulary built from its `pack_card_*` columns. See `DATA.md` for what's been verified about this source directly, including actual file sizes pulled from the bucket rather than taken from documentation.
+Per-set `draft_data_public.<SET>.PremierDraft.csv.gz` files from 17lands. See `DATA.md` for what was verified directly about the format.
 
-Before the train/val/test split is drawn, a separate subset is carved out: states where the same pack-and-pool combination recurs across different drafts and different players. This subset is never trained on — it exists solely to measure how often two people facing the same decision disagree, which is the input to the Bayes-floor check in §6. (What "the same state" means is now an open question rather than a settled one — see §6a.)
+**Several sets, not one.** Cross-set generalisation is the goal, and it is not measurable with a single set ingested. Target: 6–10 sets, chosen to span mechanical variety rather than recency.
 
-Exclusion is at *draft* granularity, not row granularity. Dropping only the matched row would leave that row's label sitting inside the pool of the very next pick of the same draft, which is in training — the answer would leak through the pool even though the row itself was withheld. `split_by_draft` supports row-level exclusion as an escape hatch if draft-level turns out to cost too much of the corpus, and using it would have to be declared.
+**Pack geometry must be inferred, not assumed.** Ingest currently hardcodes 14 selectable cards and 3 packs of 14 picks. Sets exist with other geometry, and the failure is quiet rather than loud: `PickData` validates the invariant $|\text{pool}| = \text{pack\_number} \times \text{picks\_per\_pack} + \text{pick\_number}$ on load, so a wrong constant makes every draft invalid and `on_invalid="drop"` discards the entire corpus without an error. Geometry is detected during ingest, persisted in `ingest_stats.json`, and read by `PickData` and `ModelConfig` — the pattern `card_feature_dim` already follows.
 
-## 3. Architecture
+## 3. Representation
 
-Full design is in `ARCHITECTURE.md`. The two things worth restating here because they drive the grid design directly:
+This is the stage the whole goal rests on, and it is where the previous version of the project was wrong.
 
-**3a — the BDH port is the long pole.** There's no existing JAX implementation to build from; the reference implementation is a bare PyTorch script. Before any grid compute goes anywhere near it, it needs to pass its own acceptance test: train stably on a small toy task, show no NaNs, and actually exhibit the sparse/positive activation pattern the architecture is supposed to produce. Given this is a few-months-old, single-paper architecture, the honest expectation is that this stage takes real debugging time and shouldn't be assumed to just work on the first pass.
+### 3a. Every feature column must mean the same thing in every set
 
-**3b — parameter counts get derived by hand, not just read off `count_params()`.** Same discipline as the original addition-transformer exercise's exact term-by-term derivation. This matters more here than it did there, because BDH's sparsity means an iso-parameter comparison and an iso-FLOP comparison are genuinely different experiments — both get run and reported (§5).
+Colour identity, castable colours, mana value, type flags, rarity, power/toughness and `is_creature` already satisfy this. **Keyword flags do not.** They are fitted per set: on FIN, 84 of 118 Scryfall keywords occur on exactly one card and are dropped by `MIN_KEYWORD_CARDS`, leaving 34 columns whose meanings are particular to FIN. Column 41 is a different keyword in a different set, so a checkpoint is only interpretable alongside the exact table it trained against. That is disqualifying for a bot meant to draft an unseen set.
 
-## 4. Grid design
+They are replaced by two things:
 
-A pilot grid comes first and exists purely to catch pipeline bugs before spending real compute: a handful of model sizes crossed with a couple of data fractions, one seed, both architectures. If loss curves don't look sane here, nothing downstream is worth running yet.
+- **A fixed global keyword vocabulary** — a checked-in constant list, not fitted from the set at hand. Covers evergreen mechanics identically everywhere.
+- **Structured mechanical features derived from oracle text** — roughly 80 columns pattern-matched over Scryfall's `oracle_text`: creates tokens, sacrifice outlet, cares about creatures dying, +1/+1 counters (makes and cares), graveyard recursion, self-mill, discard, draw, lifegain source and payoff, artifacts matter, enchantments matter, equipment and auras, tribal type reference, cares about attacking or blocking, ETB trigger, death trigger, activated ability with a mana cost, instant-speed interaction, removal by damage/destroy/exile/-X-X, counterspell, ramp and fixing, card selection.
 
-The full grid: five or six model sizes, log-spaced from roughly half a million to fifty million parameters (comfortably inside both the addition-transformer's demonstrated free-TPU regime and BDH's own tested 10M–1B range), crossed with four or five log-spaced fractions of the training set, two seeds per cell, both architectures. That's on the order of 80 runs. If wall-clock time turns out to be the binding constraint, seeds get cut before grid coverage does — averaging out noise matters less than actually having enough points to fit an exponent against.
+### 3b. Structured features rather than a sentence embedding, and why
 
-## 5. Fitting
+The obvious alternative is a frozen sentence encoder over the rules text. It is the wrong tool for this particular job, for a reason worth stating because it is not obvious: **sentence encoders are trained for semantic similarity, and synergy is complementarity.** "Sacrifice a creature: draw a card" and "Create two 1/1 tokens" are maximally synergistic and not remotely similar; "create two 1/1 tokens" and "create three 1/1 tokens" are similar and largely redundant. A similarity-shaped embedding space puts the wrong pairs near each other for this purpose.
 
-Both curves are fit using the same robust procedure the Chinchilla paper used — a Huber loss on log-residuals rather than naive least-squares on raw loss, since raw least-squares over-weights the small-$N$, high-loss corner of the grid. Exponents are reported with bootstrapped confidence intervals, not bare point estimates. Both the iso-parameter and iso-FLOP fits are reported side by side, for the reason given in `ARCHITECTURE.md`'s fairness note.
+Structured columns avoid that by construction: sacrifice-outlet and token-maker are separate features, so a bilinear form in the interaction arm learns their interaction in a single weight. They are also low-dimensional, set-independent by construction, and interpretable — which is what makes "why did it think these two cards go together" answerable.
 
-## 6. The Bayes-error floor
+A small projected text embedding can ride alongside later as a catch-all for mechanics the patterns miss. It is not the starting point.
 
-For every recurring pack/pool state in the held-out matched-state subset, compute the empirical spread of what different humans actually picked, and turn that into a single floor number — the cross-entropy of that empirical distribution against itself, which is the loss no model can beat if the underlying human choice is genuinely stochastic at that state.
+### 3c. Three failure modes to design against
 
-The interesting result isn't just "the fitted $E$ matches the floor." A mismatch is worth reporting too, and worth being direct about in the writeup rather than glossing over — if $E$ comes in below the measured floor, that's a sign the model (or the split) is leaking something it shouldn't have access to, not a sign the architecture beat human unpredictability.
+- **Name leakage.** Scryfall's `oracle_text` spells out the card's own name ("Whenever Zidane, Tantalus Thief attacks…"). Processing that raw reintroduces card identity as a feature — exactly the failure `MIN_KEYWORD_CARDS` exists to prevent, in continuous form. The name is stripped to a placeholder before anything reads the text.
+- **Reminder text.** Parenthetical reminder text is redundant with the keyword flags and inflates apparent similarity between unrelated cards sharing a mechanic. Stripped.
+- **Width inflating the small-$N$ corner.** `card_embedding` contains `_dense(F, embed_hidden)`, which is linear in $D$ while the rest of the model is quadratic. A wide table therefore inflates small models proportionally more than large ones, bending exactly the corner of the grid the Huber-on-log-residuals fit is most sensitive to. Total feature width stays under ~120 columns.
 
-### 6a. Measured: exact state matching does not work, and the obvious relaxation is a trap
+`CardFeatures.dense()` remains the single place the column layout lives.
 
-This was checked on the **full FIN corpus — all 5,889,954 picks across 140,237 drafts** — as soon as the ingest pipeline could produce it, rather than being left as a stage-6 discovery. Two findings, both load-bearing:
+## 4. Architecture
 
-**Exact `(pack, pool, pack_number, pick_number)` matching yields zero recurring states.** Not "few" — zero, across the entire corpus. The reason is structural rather than a sample-size artifact: the pool is a near-unique fingerprint almost immediately. By pack 0 pick 2, when the pool holds just *two* cards, 380 of 386 pools in a 386-draft sample are already distinct; from pool size 12 onward every pool is unique. Since pool size is fully determined by `pack_number` and `pick_number`, an exact match needs a pool collision, and pools stop colliding almost at once. Going from a 16k-pick sample to the full 5.9M-pick corpus — a 363x increase — moved this number from zero to zero. It is a statement about how fast the state space opens up, not about how many samples were drawn.
+Full design in `ARCHITECTURE.md`. The three things that matter to this plan:
 
-**Dropping the pool from the state key — the natural first relaxation — concentrates the recurrence on decisions that are not decisions.** Matching on `(pack, pack_number, pick_number)` alone does find recurrence: 1,186,676 rows, 20.15% of the corpus, in 114,099 groups. But the distribution across the draft is fatal to the measurement:
+**Order is structurally unusable.** No positional encoding anywhere in the front end. Pack and pool are sets, and the architecture cannot use an order that was never there rather than being trained to ignore one.
 
-| pick | pack size | rows in a recurring state | share of that pick |
-|-----:|----------:|--------------------------:|-------------------:|
-| 0–3  | 14–11     | 0                         | 0.0%               |
-| 4–8  | 10–6      | 1,377                     | <0.3%              |
-| 9    | 5         | 4,575                     | 1.1%               |
-| 10   | 4         | 50,972                    | 12.1%              |
-| 11   | 3         | 292,861                   | 69.6%              |
-| 12   | 2         | 416,188                   | 98.9%              |
-| 13   | 1         | 420,703                   | 100.0%             |
+**Synergy lives in the interaction arm, not the feature table.** Synergy is relational and cannot be encoded in a per-card vector. The arm — pack cards as queries, pool as context — is the bilinear form that connects a candidate's behaviour to the pool's. The feature table's job is only to make that connection *representable*.
 
-95.2% of all recurrence sits at picks 11–13, where the pack holds three cards or fewer; at pick 13 the pack holds exactly one card and the loss is identically zero. Packs collide there for the trivial reason that a 1-card pack has only 363 possible values — those 420,703 rows fall into just 277 distinct groups. Meanwhile the entire region where a real decision exists, picks 0 through 8, contributes **1,377 rows: 0.12% of the recurrence, and 0.02% of those picks**. Nothing at all before pick 4.
+**The output is closed to the pack.** The pointer head scores pack slots and softmaxes over just those.
 
-A floor measured over the relaxed subset would therefore be measured almost entirely over forced non-choices and would come back near zero — an apparently clean number that means nothing, and one that would make any fitted $E$ look badly miscalibrated for reasons having nothing to do with the models. Restricting the same relaxation to picks 0–8 to avoid that gives 1,377 rows across ~679 groups, which is far too thin to fit a stable floor and is itself concentrated at picks 7–8.
+Two interaction arms are implemented: cross-attention, and a from-scratch JAX port of BDH. **BDH is a candidate mechanism, not a research subject.** It ships if it drafts better. One consequence: `neuron_multiplier` no longer needs to be pinned at 4. That value existed solely to make an iso-parameter comparison possible; with the exponent comparison dropped, BDH is sized for how well it works, and larger neuron widths are back on the table — which is also the regime where its kernel earns its place (§5).
 
-So the fallback named in §8 is not a contingency any more; it is the primary path, and it needs to be a relaxation that stays in the part of the draft where a real decision exists (roughly picks 0–8, where the pack still holds six or more cards). The relaxation has to be *chosen and justified*, not defaulted into. The candidates worth weighing:
+## 5. Kernel-level implementation scope
 
-- **Coarsen the pool, keep the pack exact.** Condition on a summary of the pool — its color distribution, curve, creature/spell split — rather than its exact contents. Two drafters with the same pack and a similarly-shaped pool are facing substantially the same decision, which is the thing the floor is supposed to measure.
-- **Drop to pairwise preference.** For each card pair $(A, B)$ that co-occurs in a pack, measure how often $A$ is taken over $B$, conditioned on a coarse pool descriptor. Sample sizes become large, but it measures a different quantity than per-state entropy and the writeup would have to say so plainly.
-- **Restrict to early picks and accept a smaller subset.** Keeps the exact-match discipline, but is now measured and ruled out on its own: 1,377 rows at picks 0–8, none before pick 4. Not enough to fit anything stable.
+The commitment is that **attention-shaped and neuron-space operations are hand-written**; LayerNorm, Dense, softmax and elementwise ops stay in XLA, which already fuses them competently and whose gradients are not worth re-deriving to save nothing.
 
-Whichever is chosen, the relaxation gets stated in the writeup as a first-class methodological decision with this measurement attached, not as a footnote.
+Current state against that commitment:
 
-## 7. Deliverables
+| | share of params | share of forward FLOPs |
+|---|---|---|
+| set encoders (pack + pool) — flax built-ins | 58% | — |
+| interaction arm — hand-written Pallas | 39% | 26% (attention) / 37% (BDH) |
+| everything outside the arm | — | 63–74% |
 
-- `src/data/` — the ingestion and vocabulary pipeline.
-- `src/models/` — the shared front-end, the attention arm, the BDH port.
-- `src/training/` — the grid runner, the fitting code, the floor measurement.
-- A final writeup carrying the same derivational rigor as the addition-transformer exercise: the fitted curves, the exponent comparison, and the floor validation, stated plainly rather than oversold.
+So the majority of the arithmetic still runs on `nn.MultiHeadDotProductAttention` (`set_encoder.py:49`). **Closing that gap — a Pallas kernel for the set encoder's masked, position-free self-attention — is a first-class task in the build order**, not an implied one. It is the same shape as the cross-attention kernel already written.
 
-## 8. Risks worth naming up front
+Two standing facts about the existing kernels, both of which belong in any writeup:
 
-- **BDH instability.** Addressed above, but worth repeating: this is not a battle-tested architecture, and the porting stage should be budgeted like a research task, not a translation exercise.
-- **Iso-parameter vs. iso-compute.** Reporting only one of them makes the headline claim ambiguous. Both get reported, always.
-- **Grid compute budget.** 80 runs is the target; cut seeds before cutting grid coverage if time runs short.
-- **Thin matched-state subset — now measured on the full corpus, and worse than "thin".** Exact-match recurring states do not merely turn out to be rare; across all 5,889,954 FIN picks there are *none*, and the obvious relaxation puts 95.2% of its recurrence on picks 11–13 where the pack holds three cards or fewer, against 0.12% across every pick where a real decision exists. See §6a for the numbers and the candidate relaxations. This is the open methodological question in the project, and it is worth settling before the grid consumes real compute, because the floor comparison is half of what makes the study more than a curve fit.
+- **They win memory traffic, not FLOPs.** Unstructured zeros still occupy a tensor-core lane; a GPU multiplies by zero as fast as by anything else. Turning BDH's FLOP advantage into wall-clock needs block-structured sparsity, which is an architectural change rather than a kernel one.
+- **They are correct but unmeasured.** Every kernel is asserted against a pure-JAX reference on values and on every gradient. None has run on real hardware — `default_interpret()` returns True off GPU/TPU, and interpret mode executes kernel semantics in pure JAX with no fusion at all. The first GPU session should re-run the kernel tests with `KERNEL_INTERPRET=0` and benchmark fused against reference across widths and neuron multipliers.
 
-## 9. Build order
+## 6. Sizing the drafter
 
-Data pipeline first, since it unblocks everything else and is comparatively low-risk. Attention arm second — it reuses more familiar ground and gets a real end-to-end loss number fast. A transformer-only pilot grid third, to validate the fitting procedure itself before BDH is even in the picture. BDH port fourth, sequenced once the harness around it already works, since it's the highest-risk stage and benefits most from not also being the stage where the pipeline itself is still being debugged. Full grid fifth. Floor measurement can run in parallel with the grid, since it's pure data analysis with no dependency on trained checkpoints. Fitting, comparison, and writeup last.
+A pilot grid is run purely to fit the law: 4–5 log-spaced widths, 3–4 log-spaced data fractions, one seed, both arms. Small enough to finish in an afternoon on one rented GPU.
+
+The fit follows Chinchilla's robust procedure — Huber loss on log-residuals rather than least squares on raw loss, since raw least squares over-weights the small-$N$, high-loss corner — with bootstrapped confidence intervals on the exponents rather than bare point estimates.
+
+Its output is a configuration, not a paper claim: given the compute budget available for the final run, $(N^*, D^*)$ says how wide the drafter should be and how much data it should see. Whichever arm's curve is better at that budget is the arm that ships.
+
+**The $D$ axis must be data scale, not data repetition.** `--data-fraction` subsamples drafts, and grid cells use `--epochs` rather than `--steps`: at fixed steps a small fraction silently means many passes, and $\beta$ would then be measuring repetition. `run.py` warns past two passes.
+
+## 7. Evaluation
+
+**Per-pick breakdown is a first-class output, not a diagnostic.** The aggregate loss averages fourteen different problems. On FIN's val split, 7.1% of rows are one-card packs with loss identically zero and 21.4% have packs of three or fewer. Zero-loss picks are harmless to exponents — they scale $A$, $B$ and $E$ but leave $\alpha$ and $\beta$ alone — but picks 11–12 are a real hazard: easy without being trivial, so they saturate at small $N$ while hard picks keep improving, and a subset that stops responding to $N$ bends the aggregate curve in a way that reads as an exponent. `summarise_by_pick` reports all-picks and picks-0-8 side by side. **Headline numbers are the picks-0-8 slice.**
+
+**Zero-shot protocol.** Train on $n-1$ sets, evaluate on the held-out set. Two reference points are required for the number to mean anything: a model trained directly on the held-out set (the ceiling) and the `pick_rate_prior` baseline (the floor). Expect a naive zero-shot figure to look decent for uninteresting reasons — rare-first and stay-on-colour carry a lot of draft accuracy, and the prior alone reaches 45.3% on FIN.
+
+**Synergy probe.** Top-1 agreement cannot distinguish a model that learned card interaction from one that learned colour-matching. Two direct measurements, in `src/analysis/`:
+
+- Hold the pack fixed, vary the pool, and report how much the candidate ranking moves. A model using synergy reorders; a colour-matcher barely does.
+- Pool ablation: real pool versus a shuffled random pool of the same size. The accuracy gap is a scalar "how much does this model use its pool at all."
+
+External validation against CubeCobra co-occurrence is the follow-up — cube curators pick cards for how they function together, so within-cube co-occurrence is a synergy signal not derivable from the model's own training data.
+
+**Drafter metrics, not classifier metrics.** A tool that shows a ranked list is judged on top-3 as well as top-1, and on calibration. Both are reported.
+
+## 8. Deliverables
+
+- A trained drafter, at the size the fit chose, with a checkpoint and an inference entry point (`src/inference/`) that takes a pack and a pool and returns ranked picks.
+- Zero-shot numbers on at least one fully held-out set, against both reference points.
+- Synergy probe results, showing the model uses its pool.
+- The fitted $L(N, D)$ curves for both arms, reported as the sizing procedure they are.
+- Hand-written kernels covering all attention-shaped and neuron-space work, with GPU benchmarks against their references.
+- A writeup carrying the derivations rather than just the results.
+
+## 9. Risks worth naming up front
+
+- **CPU-only training is the binding constraint on everything.** 561 examples/second means 2.3 hours per epoch at $d=64$ and makes the grid impossible. Nothing downstream is real until this is fixed, and the fix is cheap.
+- **Synergy may be a thin signal in the data.** Human drafters at scale pick largely on card quality and colour; genuine synergy picks are a minority of decisions. The synergy probe exists to detect a null result honestly rather than to confirm a hoped-for one.
+- **Structured mechanical features are hand-specified and therefore incomplete.** They will miss mechanics nobody thought to pattern-match. The probe and the held-out-set evaluation are what surface that.
+- **Zero-shot numbers are easy to over-read.** Without the same-set ceiling and the prior baseline reported alongside, a plausible-looking figure means nothing.
+- **BDH is not battle-tested.** A 2025 single-paper architecture with one reference implementation. Budget porting and debugging as research time, not translation.
+
+## 10. Build order
+
+1. **Get on a GPU.** Re-run both pilots unchanged to establish throughput. Re-run kernel tests with `KERNEL_INTERPRET=0`.
+2. **Multi-set ingest**, with pack geometry inferred and persisted.
+3. **Rebuild the feature table** — global keywords plus structured mechanical features, name-stripped, width-capped.
+4. **Write the synergy probe** before the runs that would need it, so the representation change can be judged.
+5. **In-distribution check:** one set, one width, old features versus new. If mechanical features do not beat keyword flags within a single set, they will not enable zero-shot either, and this costs minutes.
+6. **Zero-shot probe** at one size: train on $n-1$ sets, test on the held-out one.
+7. **Pilot grid and fit**, on the settled representation.
+8. **Train the drafter** at $(N^*, D^*)$ with the winning arm.
+9. **Set-encoder Pallas kernel**, closing the from-scratch gap in §5.
+10. **Inference entry point and CLI**, then the writeup.
+
+Steps 1–3 unblock everything. Step 4 before step 5 is deliberate: without the probe, step 5 can only tell you the loss moved, not why.
