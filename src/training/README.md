@@ -38,6 +38,48 @@ change would load silently into the wrong shapes, evaluate without complaint,
 and report a plausible but wrong loss for a grid cell -- the sort of error a
 scaling fit absorbs rather than reveals.
 
+## Resuming an interrupted run
+
+A Colab runtime caps at 12h and is reclaimed after 90 minutes idle, so a long
+cell will be interrupted. `--resume` continues one:
+
+    python -m src.training.run --processed-dir data/processed/FIN.PremierDraft \
+        --width 64 --steps 3000 --out-dir runs/attn_d64 \
+        --max-seconds 3600 --resume
+
+`--max-seconds` stops at the next `--eval-every` boundary once that much wall
+clock has passed and exits **75** instead of 0, leaving a resumable state
+behind. Re-invoking the identical command continues it. Anything else non-zero
+is a real failure, so a caller driving a remote session can tell "there is more
+to do" from "this broke" without parsing output.
+
+This is deliberately *not* the same artefact as the best-val checkpoint above.
+That one holds the parameters any later analysis wants; it carries no optimiser
+moments, no step counter and no position in the shuffled batch stream.
+Restarting from it would reset Adam to zero partway along a decayed learning
+rate and replay data the run had already seen. So `resume.msgpack` and
+`resume.json` sit alongside it holding current params, optimiser state,
+best-so-far, the history, and the stream position -- written atomically at every
+evaluation boundary, and deleted once the run completes so a finished cell
+cannot be mistaken for a resumable one.
+
+**The batch stream position is restored exactly, not approximately.**
+`BatchStream` saves `(reshuffles, cursor)` rather than the permuted order
+itself -- the order is a few million int64s, and it is anyway a pure function of
+the seed and the number of reshuffles so far, so restoring replays that many
+permutations in milliseconds. `tests/test_checkpoint.py` asserts that a run
+chopped into four segments lands on bit-for-bit identical parameters to an
+uninterrupted one, with an identical loss curve. A resume that silently
+replayed or skipped data would still converge, just to a different place, and
+would put a discontinuity at every interruption that the scaling fit would read
+as structure.
+
+**A resume across a config change is refused, not adapted.** The saved state
+carries a fingerprint of the arm, model config, train config and training-row
+count; a mismatch raises. Continuing a d=64 run into a d=128 tree would produce
+a continuous loss curve and a meaningless result -- the same failure mode the
+explicit shape checking above exists to prevent, and harder to spot.
+
 ## Why the per-pick breakdown is a first-class output
 
 The aggregate loss averages fourteen quite different problems. Measured on the
