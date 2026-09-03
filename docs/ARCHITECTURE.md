@@ -80,6 +80,12 @@ At `D=256` and iso-parameter sizing:
 
 So at that sizing BDH starts 53% *more* expensive than the arm beside it, and perfect sparsity exploitation would claw back at most about 18%. The floor is the encodes. **A sparsity-based efficiency claim does not survive contact with this architecture at iso-parameter sizing.** `bdh_ideal_flops` computes the bound for any measured density, and `measure_density` supplies density from a real batch rather than an assumption — at initialisation it is ~0.5, a property of the initialiser that says nothing about a trained model.
 
+That does not make the comparison uninteresting — it means the interesting question is quality per parameter and per dense FLOP, not a sparsity dividend. If a sparsity dividend is wanted, it needs either a much larger `neuron_multiplier` (where the encodes stop dominating, but iso-parameter is lost) or block-structured sparsity, which is an architectural change rather than a kernel one.
+
+**Measured, not assumed.** The densities above were hypothetical. `src/training/density.py` takes them off a trained checkpoint, and the first one (`d=64`, 3,000 steps) reports query 0.3949, gate 0.1779, score 0.1566 — against 0.5024 / 0.2446 / 0.2483 on the same model at 20 steps. So training really does sparsify the arm. It does not rescue the FLOP argument: the saving is 18.9% of the arm's dense cost, against a ceiling of 22.8% that not even zero density could beat, because the three encodes are 84% of the remaining total. The argument above was made against an assumed density and survives the real one. See `RESULTS.md`.
+
+The initialisation figures are worth keeping in view: ~0.5, and ~0.25 for the gate, are properties of a symmetric encoder and would be reported by a density check run at the wrong moment, on a model that had learned nothing.
+
 ## Kernel scope
 
 **Attention-shaped and neuron-space operations are hand-written in Pallas. LayerNorm, Dense, softmax and elementwise ops stay in XLA**, which fuses them competently and whose gradients are not worth re-deriving to save nothing. That is the same line FlashAttention itself draws: hand-write where the memory-hierarchy decision is yours.

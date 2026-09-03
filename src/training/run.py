@@ -8,6 +8,14 @@ curve, the exact full-split evaluation, and the per-pick breakdown. The
 grid runner (grid.py) calls train_model directly rather than shelling out
 to this, but every flag it sweeps is exposed here so a single cell can be
 reproduced by hand.
+
+`--max-seconds` and `--resume` exist for running a cell on a runtime that
+will be taken away: a Colab session caps at 12h and is reclaimed after 90
+minutes idle, so a long cell has to run as a sequence of bounded segments.
+A budgeted run exits EXIT_INCOMPLETE (75) with resumable state on disk; the
+identical command with --resume continues it. See scripts/ for the driver
+that loops on that exit code, and src/training/README.md for why resume
+state is a separate artefact from the best-val checkpoint.
 """
 
 from __future__ import annotations
@@ -25,6 +33,12 @@ from ..models.pick_model import ModelConfig
 from .checkpoint import save_checkpoint
 from .evaluate import evaluate_by_pick, format_by_pick, summarise_by_pick
 from .train import TrainConfig, frequency_baseline, train_model, uniform_baseline
+
+# Returned instead of 0 when --max-seconds cut the run short. A caller
+# driving a Colab session loops on this: re-invoke with --resume until it
+# returns 0. Distinct from 1 so a genuine crash is never mistaken for
+# "there is more to do".
+EXIT_INCOMPLETE = 75
 
 
 def subsample_by_draft(
@@ -95,6 +109,22 @@ def main(argv: list[str] | None = None) -> int:
         "--skip-full-eval", action="store_true",
         help="skip the exact full-split evaluation (the sampled one still runs)",
     )
+    parser.add_argument(
+        "--resume", action="store_true",
+        help="continue from the resume state in --out-dir if one is present. "
+             "Restores optimiser moments, step counter and batch-stream "
+             "position, so a resumed run sees the same examples in the same "
+             "order as an uninterrupted one. Refuses if the saved state was "
+             "written by a differently configured run.",
+    )
+    parser.add_argument(
+        "--max-seconds", type=float, default=None,
+        help="stop cleanly at the next --eval-every boundary once this much "
+             "wall clock has passed, leaving a resumable state behind, and "
+             f"exit {EXIT_INCOMPLETE} rather than 0. For running a long cell "
+             "as a sequence of bounded segments on a Colab runtime that caps "
+             "at 12h and dies after 90 minutes idle.",
+    )
     args = parser.parse_args(argv)
 
     processed = Path(args.processed_dir)
@@ -123,6 +153,11 @@ def main(argv: list[str] | None = None) -> int:
         neuron_multiplier=args.neuron_multiplier,
         fused_kernels=args.fused_kernels,
         card_feature_dim=table.shape[1],
+        # Same pattern as card_feature_dim: shapes fixed by the corpus are
+        # read off the corpus. These size the two ContextFeatures embeddings,
+        # so a set with a different pack geometry would index out of range.
+        packs_per_draft=data.packs_per_draft,
+        picks_per_pack=data.picks_per_pack,
     )
     steps = args.steps
     if args.epochs is not None:
@@ -150,7 +185,31 @@ def main(argv: list[str] | None = None) -> int:
     result = train_model(
         data, table, train_indices, splits.val, model_config, train_config,
         arm=args.arm, checkpoint_dir=out_dir,
+        resume=args.resume, max_seconds=args.max_seconds,
     )
+
+    if not result["completed"]:
+        # Stopped on the segment budget. The resume state in out_dir is the
+        # artefact that matters here; writing metrics.json now would leave a
+        # file that looks like a finished cell but holds a truncated curve.
+        progress = {
+            "completed": False,
+            "stopped_at_step": result["stopped_at_step"],
+            "total_steps": steps,
+            "best_val_loss": result["best_val_loss"],
+            "best_step": result["best_step"],
+            "elapsed_s": result["elapsed_s"],
+            "history": result["history"],
+        }
+        (out_dir / "progress.json").write_text(
+            json.dumps(progress, indent=2), encoding="utf-8"
+        )
+        print(
+            f"\nincomplete: {result['stopped_at_step']:,} of {steps:,} steps. "
+            f"Re-run the same command with --resume to continue.\n"
+            f"wrote {out_dir / 'progress.json'} and resume state"
+        )
+        return EXIT_INCOMPLETE
 
     # The saved checkpoint tracks best-val; make the final artefact agree.
     best_params = result["best_params"]
@@ -169,6 +228,7 @@ def main(argv: list[str] | None = None) -> int:
         "train_drafts": int(np.unique(data.draft_idx[train_indices]).size),
         "data_fraction": args.data_fraction,
         "seed": args.seed,
+        "completed": True,
         "steps": steps,
         "examples_seen": steps * args.batch_size,
         "epochs": epochs,
@@ -225,6 +285,9 @@ def main(argv: list[str] | None = None) -> int:
     (out_dir / "metrics.json").write_text(
         json.dumps(metrics, indent=2), encoding="utf-8"
     )
+    # Leftover from an earlier segment of this same cell; keeping it would
+    # leave a finished run advertising itself as incomplete.
+    (out_dir / "progress.json").unlink(missing_ok=True)
     print(f"\nwrote {out_dir / 'params.msgpack'} and {out_dir / 'metrics.json'}")
     return 0
 

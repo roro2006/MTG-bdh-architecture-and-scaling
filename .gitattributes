@@ -1,0 +1,6 @@
+# This repo is checked out both on Windows (OneDrive) and inside WSL. Without
+# this, a round-trip through the Windows copy rewrites every file with CRLF and
+# `git diff` reports all 25 source files as fully rewritten -- which buries real
+# changes and makes "is everything pushed?" impossible to answer by eye.
+# Normalise to LF in the object database regardless of what the worktree holds.
+* text=auto eol=lf

@@ -83,20 +83,68 @@ def frequency_baseline(
     return float(loss), float(accuracy)
 
 
+class BatchStream:
+    """Infinite shuffled stream of batches drawn from `indices`.
+
+    A class rather than a generator so its position can be saved and
+    restored. Resuming a run that replayed data it had already seen -- or
+    skipped data it had not -- would put a discontinuity in the loss curve
+    at every interruption, and the scaling fit would read that as
+    structure rather than as an artefact of the 12h session cap.
+
+    The position is `(reshuffles, cursor)` rather than the permuted order
+    itself: `order` is a few million int64s, far too large to sit in a JSON
+    resume file, and it is anyway a pure function of the seed and the
+    number of reshuffles so far. Restoring replays that many permutations,
+    which costs milliseconds and reproduces the order exactly.
+    """
+
+    def __init__(
+        self, data: PickData, indices: np.ndarray, batch_size: int, seed: int
+    ):
+        self._data = data
+        self._indices = indices
+        self._batch_size = batch_size
+        self._seed = seed
+        self._rng = np.random.default_rng(seed)
+        self._reshuffles = 0
+        self._cursor = 0
+        self._order = self._reshuffle()
+
+    def _reshuffle(self) -> np.ndarray:
+        self._reshuffles += 1
+        self._cursor = 0
+        return self._rng.permutation(self._indices)
+
+    def __iter__(self) -> "BatchStream":
+        return self
+
+    def __next__(self) -> dict:
+        if self._cursor + self._batch_size > self._order.size:
+            self._order = self._reshuffle()
+        chunk = self._order[self._cursor : self._cursor + self._batch_size]
+        self._cursor += self._batch_size
+        return self._data.batch(chunk)
+
+    def state(self) -> dict:
+        return {"reshuffles": self._reshuffles, "cursor": self._cursor}
+
+    def restore(self, state: dict) -> None:
+        """Winds the stream forward to a previously saved position."""
+        target = int(state["reshuffles"])
+        self._rng = np.random.default_rng(self._seed)
+        self._reshuffles = 0
+        self._order = self._indices
+        for _ in range(target):
+            self._order = self._rng.permutation(self._indices)
+            self._reshuffles += 1
+        self._cursor = int(state["cursor"])
+
+
 def _batch_stream(
     data: PickData, indices: np.ndarray, batch_size: int, seed: int
-):
-    """Infinite shuffled stream of batches drawn from `indices`."""
-    rng = np.random.default_rng(seed)
-    order = rng.permutation(indices)
-    cursor = 0
-    while True:
-        if cursor + batch_size > order.size:
-            order = rng.permutation(indices)
-            cursor = 0
-        chunk = order[cursor : cursor + batch_size]
-        cursor += batch_size
-        yield data.batch(chunk)
+) -> BatchStream:
+    return BatchStream(data, indices, batch_size, seed)
 
 
 def train_model(
@@ -109,6 +157,8 @@ def train_model(
     arm: str = "attention",
     verbose: bool = True,
     checkpoint_dir: str | Path | None = None,
+    resume: bool = False,
+    max_seconds: float | None = None,
 ) -> dict:
     """Trains one cell and returns its metrics plus the metadata the fit needs.
 
@@ -116,6 +166,17 @@ def train_model(
     validation loss improves. A grid cell is tens of minutes of compute;
     losing all of it to a crash at step 2,900 is avoidable, and the
     best-val parameters are what any later analysis wants anyway.
+
+    Alongside that best-val artefact, a full resume state (optimiser
+    moments, step counter, batch-stream position) is written at every
+    evaluation boundary. `resume=True` picks it up and continues; see the
+    note in checkpoint.py for why the two are separate files.
+
+    `max_seconds` stops the run cleanly at the next evaluation boundary once
+    that much wall clock has elapsed, leaving a resumable state behind. A
+    Colab session dies at 12h and after 90 minutes idle, so a long cell has
+    to be run as a sequence of bounded segments; the returned `completed`
+    flag says whether this was the last one.
     """
     model, params = init_model(model_config, feature_table, arm=arm, seed=train_config.seed)
     analytic = count_params_analytic(model_config, arm=arm)
@@ -172,28 +233,101 @@ def train_model(
             accuracies.append(float(accuracy))
         return float(np.mean(losses)), float(np.mean(accuracies))
 
-    stream = _batch_stream(data, train_indices, train_config.batch_size, train_config.seed)
+    stream = BatchStream(
+        data, train_indices, train_config.batch_size, train_config.seed
+    )
     history: list[dict] = []
-    started = time.monotonic()
     best_val = float("inf")
     best_params = params
     best_step = 0
+    start_step = 0
 
-    for step in range(1, train_config.total_steps + 1):
+    # Imported here for the same reason the save below is: checkpoint.py
+    # imports from pick_model, and keeping these local leaves it free to
+    # import from this module later without a cycle.
+    from .checkpoint import (
+        clear_resume,
+        load_resume,
+        resume_fingerprint,
+        save_checkpoint,
+        save_resume,
+    )
+
+    fingerprint = resume_fingerprint(
+        model_config=model_config,
+        train_config=train_config,
+        arm=arm,
+        train_rows=int(train_indices.size),
+    )
+    if resume and checkpoint_dir is not None:
+        saved = load_resume(
+            checkpoint_dir,
+            params_template=params,
+            opt_state_template=opt_state,
+            fingerprint=fingerprint,
+        )
+        if saved is not None:
+            params = saved["params"]
+            opt_state = saved["opt_state"]
+            best_params = saved["best_params"]
+            best_val = saved["best_val"]
+            best_step = saved["best_step"]
+            history = saved["history"]
+            start_step = saved["step"]
+            stream.restore(saved["stream_state"])
+            if verbose:
+                print(
+                    f"  resuming at step {start_step:,} of "
+                    f"{train_config.total_steps:,} "
+                    f"(best val {best_val:.4f} at step {best_step:,})",
+                    flush=True,
+                )
+
+    if start_step >= train_config.total_steps:
+        # Nothing left to do. Fall through so the caller still gets a full
+        # result dict rather than having to special-case a finished run.
+        if verbose:
+            print("  already complete; nothing to train", flush=True)
+
+    # Wall clock accumulated by earlier segments, so `elapsed_s` in the
+    # history stays monotonic across an interruption instead of resetting.
+    elapsed_offset = history[-1]["elapsed_s"] if history else 0.0
+    started = time.monotonic()
+    completed = True
+
+    def _elapsed() -> float:
+        return elapsed_offset + (time.monotonic() - started)
+
+    def _write_resume(step: int) -> None:
+        if checkpoint_dir is None:
+            return
+        save_resume(
+            checkpoint_dir,
+            params=params,
+            opt_state=opt_state,
+            best_params=best_params,
+            step=step,
+            best_val=best_val,
+            best_step=best_step,
+            history=history,
+            stream_state=stream.state(),
+            fingerprint=fingerprint,
+        )
+
+    # Seeded so `stopped_at` is well defined even when the loop body never
+    # runs, which is what an already-finished run being re-resumed looks like.
+    step = start_step
+    for step in range(start_step + 1, train_config.total_steps + 1):
         batch = {k: jnp.asarray(v) for k, v in next(stream).items()}
         params, opt_state, loss, accuracy = train_step(params, opt_state, batch)
 
         if step % train_config.eval_every == 0 or step == train_config.total_steps:
             val_loss, val_accuracy = evaluate()
-            elapsed = time.monotonic() - started
+            elapsed = _elapsed()
             improved = val_loss < best_val
             if improved:
                 best_val, best_params, best_step = val_loss, params, step
                 if checkpoint_dir is not None:
-                    # Imported here to keep checkpoint.py free to import from
-                    # this module later without a cycle.
-                    from .checkpoint import save_checkpoint
-
                     save_checkpoint(
                         checkpoint_dir,
                         params,
@@ -222,8 +356,42 @@ def train_model(
                     flush=True,
                 )
 
+            # Resume state is written at every evaluation boundary, not only
+            # on improvement: a run killed at step 2,900 must restart from
+            # 2,750, not from whichever earlier step last happened to be a
+            # new best.
+            _write_resume(step)
+
+            # `step < total_steps` so the budget can never fire on the last
+            # step: the run is finished at that point, and reporting it as
+            # incomplete would send the caller into a resume that has nothing
+            # left to do.
+            if (
+                max_seconds is not None
+                and step < train_config.total_steps
+                and _elapsed() >= max_seconds
+            ):
+                completed = False
+                if verbose:
+                    print(
+                        f"  segment budget reached ({_elapsed():,.0f}s >= "
+                        f"{max_seconds:,.0f}s) at step {step:,} of "
+                        f"{train_config.total_steps:,}; state saved, resumable",
+                        flush=True,
+                    )
+                break
+
+    stopped_at = min(step, train_config.total_steps)
+    if completed and checkpoint_dir is not None:
+        # A finished run must not leave resume state behind: re-running the
+        # cell would otherwise find it, decide there is nothing to do, and
+        # silently re-report the old numbers.
+        clear_resume(checkpoint_dir)
+
     val_loss, val_accuracy = evaluate()
     return {
+        "completed": completed,
+        "stopped_at_step": int(stopped_at),
         "arm": arm,
         "hidden_dim": model_config.hidden_dim,
         "num_params": actual,

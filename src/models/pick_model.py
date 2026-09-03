@@ -55,6 +55,12 @@ class ModelConfig:
     # values are unchanged (tests/test_kernels.py), so this is purely an
     # execution choice and can be flipped per run.
     fused_kernels: bool = False
+    # Sow BDH's realised activation density so a *trained* model can be
+    # measured, not just a freshly initialised arm. Off by default: it costs
+    # three extra reductions per block and is only wanted for the iso-FLOP
+    # accounting and the sparsity half of PROJECT_PLAN.md's 3a acceptance
+    # gate. Adds no parameters, so a checkpoint is readable either way.
+    collect_density: bool = False
     embed_hidden_dim: int | None = None
     card_feature_dim: int = 65
     packs_per_draft: int = 3
@@ -146,6 +152,7 @@ class PickModel(nn.Module):
                 num_layers=config.arm_layers,
                 neuron_multiplier=config.neuron_multiplier,
                 fused=config.fused_kernels,
+                collect_density=config.collect_density,
                 name="arm",
             )(pack_repr, pack_mask, pool_repr, pool_mask, context)
         else:
@@ -246,8 +253,18 @@ def count_params_analytic(config: ModelConfig, arm: str = "attention") -> dict[s
     return counts
 
 
-def count_params_actual(params) -> int:
-    return int(sum(np.prod(leaf.shape) for leaf in jax.tree_util.tree_leaves(params)))
+def count_params_actual(variables) -> int:
+    """N for the scaling law: the size of the *params* collection only.
+
+    Takes either a full variables dict or a bare params tree. The
+    distinction is not pedantic -- flax returns every collection from
+    `init`, and `collect_density=True` adds a sown one whose arrays are
+    activations, not weights. Summing the whole tree counted those as
+    parameters, which would have moved N by the batch size of whatever
+    dummy input built the tree and quietly bent the fitted alpha.
+    """
+    tree = variables["params"] if "params" in variables else variables
+    return int(sum(np.prod(leaf.shape) for leaf in jax.tree_util.tree_leaves(tree)))
 
 
 def init_model(

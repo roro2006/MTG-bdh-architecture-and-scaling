@@ -52,6 +52,112 @@ The first set through the pipeline. 363 cards, **5,889,954 picks across 140,237 
 
 The gzip is never decompressed to disk; ingest streams it.
 
+## Beyond one set: the multi-set corpus
+
+One set cannot show whether a drafter generalises, so nine more were pulled — eight of which turned out to be usable. The point was never the extra volume; it was to find out what a second set does that the first one did not, and the answer turned out to be "quite a lot".
+
+| set | cards | picks | drafts | geometry | pack width | kept after load | dropped drafts |
+|---|---:|---:|---:|---|---:|---:|---:|
+| `AFR` | 266 | 1,066,415 | 26,177 | 3 x 14 | 14 | **0 — excluded** | 0 |
+| `BLB` | 276 | 6,070,278 | 156,706 | 3 x 13 | 13 | 6,028,815 | 2,121 |
+| `DSK` | 286 | 7,082,745 | 169,666 | 3 x 14 | 14 | 7,042,224 | 1,994 |
+| `EOE` | 321 | 4,070,699 | 104,377 | 3 x 13 | 13 | 4,070,547 | 4 |
+| `FIN` | 363 | 5,889,954 | 140,237 | 3 x 14 | 14 | 5,889,954 | 0 |
+| `HBG` | 271 | 1,513,835 | 36,330 | 3 x 14 | 14 | 1,497,552 | 674 |
+| `LCI` | 291 | 6,121,985 | 137,070 | 3 x 15 | 15 | 6,073,425 | 2,105 |
+| `MH3` | 326 | 5,370,272 | 128,647 | 3 x 14 | 14 | 5,340,300 | 1,497 |
+| `OTJ` | 381 | 8,249,043 | 197,554 | 3 x 14 | 14 | 8,203,104 | 2,242 |
+| `SIR` | 357 | 2,174,412 | 48,740 | 3 x 15 | 15 | 2,154,915 | 853 |
+
+**Nine usable sets, 46,300,836 picks, 2,872 card slots — of which 2,817 are distinct cards.** Only 55 slots are repeats, so the sets share almost nothing: a model that transfers between them has to be reading card attributes, not remembering cards. That is exactly the condition the set-independent feature table was rewritten for, and it is why one set could never have tested it.
+
+Every set validates clean under `python -m src.validation`. `AFR` is excluded for the reason given below; its row is kept in the table so the exclusion is on the record rather than invisible.
+
+### What ingesting a second set actually cost
+
+Everything below was found by trying to ingest these files, not by reading a spec. Each one stopped a set dead, and each is now covered by a test in `tests/test_export_formats.py` or `tests/test_geometry.py`.
+
+**Three different pack geometries turned up across ten sets, and four of the ten are not 14.** `SIR` and `LCI` draft **15** cards per pack; `BLB` and `EOE` draft **13**. Only five of the nine usable sets are Arena's familiar 3×14. This is the case the pack-geometry work exists for, and the old failure mode is worth stating precisely.
+
+For the 15-card sets, `MAX_PACK_SIZE = 14` in `ingest.py` would at least have raised — loudly, which is fine. **The 13-card sets are the ones that should worry anyone**, because 13 ≤ 14 clears that guard entirely and nothing in ingest would have said a word. In every case the dangerous constant was `PICKS_PER_PACK = 14` in `dataset.py`: it makes `pack_number * 14 + pick_number` disagree with every row's position in its draft, so every draft fails the pool-as-prefix identity and the default `on_invalid="drop"` discards the whole corpus — **18.3M of the 46.3M usable picks, across four sets** — and returns an empty `PickData` without raising anything at all.
+
+Geometry is now measured during ingest, written to `ingest_stats.json`, and read back by `PickData`. It is also passed into `ModelConfig`, because it sizes the two `ContextFeatures` embeddings, and JAX clamps an out-of-range `nn.Embed` index rather than raising: a 14-row pick embedding asked for index 14 returns row 13 and trains happily on the wrong vector.
+
+**`AFR` is a gzipped tar, not a gzipped CSV.** Same `.csv.gz` extension as every other set; inside is a tar holding one file. Read as plain gzip nothing raises — the 512-byte tar header runs straight into the first CSV line, so the header parses fine and the first column comes back as archive metadata glued to a real column name. `vocab.open_text` sniffs for the tar magic at byte 257 rather than trusting the filename.
+
+**`AFR` also has different metadata columns.** No `rank`, no `user_n_games_bucket`, no `user_game_win_rate_bucket`; it carries `user_match_win_rate_bucket` and `user_n_matches_bucket` instead. The old code required the union of every set's metadata columns, which rejected a valid export. Only the four columns ingest genuinely needs — `draft_id`, `pack_number`, `pick_number`, `pick` — are required now; the rest are read when present and defaulted when absent.
+
+**`AFR` is nevertheless unusable, and that is a real finding rather than a parsing failure.** Its export omits every draft's very first pick: there is no row anywhere with `pack_number == 0` and `pick_number == 0`, and drafts are 41 rows where 3×14 predicts 42. The taken card survives only in the `pool_*` columns of the next row, which ingest deliberately does not read. So every pool reconstructed from AFR by the prefix rule would be short by exactly one card, throughout the whole draft. Recovering it would mean seeding each draft's pool from the `pool_*` columns of its first surviving row — a change to how pools are represented, not a parsing tweak — so AFR is excluded and the reason recorded here.
+
+**Three sets contain a handful of rows whose recorded pick is not in their recorded pack** — one in `SIR`, five in `LCI`, four in `EOE`, out of 2.2M, 6.1M and 4.1M rows respectively. A single such record used to abort the entire set. A malformed row is now dropped, which shortens its draft, which makes `PickData` drop the rest of that draft — so the bad row can never leak into a neighbouring pool — and `max_bad_row_fraction` (default 0.1%) keeps genuine header misalignment loud.
+
+**Counts, not flags, matters far more outside FIN.** FIN has zero rows with a card at count 2 or more, which makes it a poor set to have validated the parse against. `OTJ` has 250,354, `DSK` 238,768, `BLB` 217,353 and `MH3` 168,691 — around 3% of their rows each. A boolean parse would silently shrink those packs.
+
+**Scryfall's `/cards/collection` refuses the full `"Front // Back"` name that 17lands uses for split, transforming and Room cards.** Verified live: it returns `Crime // Punishment` in `not_found` and resolves the same card when asked for `Crime`. `fetch_scryfall_cards` had a fallback for the opposite direction only, so `DSK` lost 23 of its 286 cards — all of Duskmourn's Rooms — to all-zero feature rows, and `OTJ` lost one. Unresolved names containing `//` are now retried by front face; both sets resolve completely.
+
+**Two of `HBG`'s cards remain unresolved and that is correct** (`A-Baba Lysaga, Night Witch`, `A-Monster Manual`). The `A-` prefix marks an Alchemy *rebalance*, and Scryfall does not index those at all — its search endpoint 404s on the name. Substituting the paper card would fabricate precisely what the rebalance changed, so they keep neutral all-zero rows. `src/validation.py` reports unresolved cards and fails only above 2% of a set, so a genuine source gap is visible without permanently blocking the gate on HBG.
+
+### Making the silent failures loud
+
+The through-line above is that the expensive failures were the quiet ones. `PickData` now refuses to return a corpus that is mostly gone: dropping a few malformed drafts is routine, but dropping nearly all of them means the loader is wrong about the corpus's shape rather than the corpus being broken. The diagnosis reports the modal rows-per-draft against the geometry, which is the single fact that identifies the cause. On AFR it says:
+
+    1,066,415 of 1,066,415 rows (100.0%) belong to drafts that violate the
+    pool-as-prefix identity at geometry 3 packs x 14 picks = 42 picks/draft,
+    pack width 14. Most drafts have 41 rows where this geometry predicts 42;
+    the export is probably missing 1 pick(s) per draft rather than being the
+    geometry recorded.
+
+`python -m src.validation --processed-dir <dir>` is the gate to run after ingesting a new set.
+
+### Fetching them
+
+    python -m src.data.ingest --csv data/raw/draft_data_public.<SET>.PremierDraft.csv.gz \
+        --out data/processed/<SET>.PremierDraft
+    python -m src.data.card_features --processed-dir data/processed/<SET>.PremierDraft --report
+
+The Scryfall JSON for each set is cached under `data/raw/scryfall/<SET>.json`, so rebuilding features does not re-hit the API.
+
+## Card features: one column layout for every set
+
+The feature table feeding the composite embeddings (`src/data/card_features.py`) used to fit its keyword columns to whichever set it was building, keeping any Scryfall keyword carried by at least two of that set's cards. That was the right guard for a per-set fit — a keyword on one card is that card's id in disguise — but the fit itself was the problem: **column *k* was a different keyword in a different set**, so a table built on FIN meant nothing to a model reading BLB. For a project whose stated goal is drafting a set the model has never seen, that is fatal.
+
+FIN's old build shows it plainly. Of its 34 keyword columns, 21 do not exist in the fixed vocabulary, and the clearest cases are FIN's own named mechanics — `Job select` (16 cards) and `Tiered` (6) — which nothing outside the set has at all.
+
+The layout is now two checked-in module constants:
+
+- **`GLOBAL_KEYWORDS`** — the 15 evergreen keywords. A set that never prints one gets an all-zero column; that costs one column and preserves the correspondence, which is the trade being made deliberately.
+- **`MECHANICS`** — 73 structured predicates pattern-matched against Scryfall oracle text: creates tokens, sacrifice outlet, cares about creatures dying, +1/+1 counters made and cared about, graveyard recursion, self-mill, discard, draw, lifegain source and payoff, artifacts and enchantments matter, equipment and auras, tribal reference, attack and block triggers, ETB and death triggers, activated abilities with a mana cost, instant speed, the four kinds of removal, counterspells, ramp and fixing, card selection.
+
+The mechanics are separate columns on purpose. The cross-attention arm scores a candidate against the pool through a bilinear interaction, and a bilinear form can only learn "a sacrifice outlet plus a token maker is worth more than either alone" if those are two distinguishable inputs. Collapse them into one aggregate score and the interaction has nothing left to find. That is also why a sentence embedding of the oracle text would be the wrong tool here: embedders encode *similarity*, and synergy is *complementarity*.
+
+### Three things the text pipeline has to get right
+
+1. **Strip the card's own name, in both spellings.** Scryfall uses the full name — *Vivi Ornitier*: "…where X is Vivi Ornitier's power" — and, for a legendary permanent, the pre-comma short name alone: *Zidane, Tantalus Thief*: "When **Zidane** enters, gain control of target creature…". A stripper that only handled full names would leave "Zidane" sitting in the features, which is card identity leaking straight in — the exact failure the old `MIN_KEYWORD_CARDS` threshold existed to prevent. Both forms are replaced with `~`, longest first, so removing the short form cannot leave a dangling `", Tantalus Thief"` behind. Matching is case-sensitive, because card names are capitalised in rules text while the words they collide with are not — a card named *Fire* loses its own name without eating "firebreathing".
+2. **Strip reminder text in parentheses.** It restates what a keyword already means, so it is redundant with the keyword flags, and it inflates apparent similarity between two unrelated cards that happen to share one mechanic.
+3. **Read both faces of a double-faced card.** Their top-level `oracle_text` is empty and the text lives on `card_faces`; reading only the top level drops the card entirely, and reading only the front face drops half of it.
+
+### Does it actually work across sets?
+
+Built over all nine usable sets, the table is byte-for-byte the same 119 columns everywhere, and **no column is dead in every set** — all 73 mechanics fire somewhere, so none is pure width. The occupancies also move the way they should if the patterns are picking up real mechanics rather than templating noise:
+
+| column | highest | lowest |
+|---|---|---|
+| `references_creature_type` | SIR 26.3% | EOE 6.2% |
+| `tribal_lord` | BLB 1.8% | EOE 0.0% |
+| `equipment_matters` | FIN 11.3% | BLB 1.8% |
+| `graveyard_size_matters` | LCI 9.3% | EOE 0.0% |
+| `artifacts_matter` | EOE 8.7% | DSK 0.0% |
+| `make_treasure` | HBG 8.1% | EOE 0.0% |
+
+Shadows over Innistrad and Bloomburrow are the tribal sets; Final Fantasy is the equipment set; Duskmourn prints essentially no artifact payoffs. Those are the right answers, and none of them was fitted — every column is a module constant.
+
+### Width is a real constraint
+
+`dense()` is capped at 120 columns (`MAX_FEATURE_WIDTH`, asserted at build time and in the tests). The card embedding is `_dense(F, embed_hidden)` — linear in the feature width — while the rest of the model is quadratic in `hidden_dim`. A wide table therefore inflates small-*N* models proportionally more than large-*N* ones, which bends exactly the low-*N* corner the Chinchilla Huber fit is most sensitive to. FIN's table goes from 65 columns to 119.
+
+One honest cost of the change: with a global vocabulary, a keyword can legitimately fire on a single card in a given set — `Double strike` does in FIN — where the old per-set threshold would have dropped it. Within a single-set training run that column is still effectively a one-hot for that card. It is 4 such columns out of 119 now, against 84 of 118 under the old scheme, and unlike before the column means the same thing in the next set.
+
+
 ## Scryfall — where card behaviour comes from
 
 Official bulk-data API (`api.scryfall.com/bulk-data`), live. Only the cards in each set's vocabulary are fetched, via `/cards/collection` at 75 identifiers per POST, rather than the ~150MB oracle-cards bulk export. Scryfall asks for a descriptive User-Agent and 50–100ms between requests; both are honoured.

@@ -162,3 +162,157 @@ def test_summarise_separates_forced_picks_from_real_decisions():
     # A one-card pack is a forced pick, not a decision.
     assert summary["forced_rows"] == 100
     assert summary["forced_fraction"] == pytest.approx(0.25)
+
+
+# --------------------------------------------------------------------------
+# Resume
+# --------------------------------------------------------------------------
+#
+# The property under test is the same one the rest of this file is about:
+# agreement, not merely "it ran". A resume that restarts Adam from zero, or
+# replays a batch the run had already consumed, still produces a smooth
+# plausible loss curve -- it just produces the wrong one, and a scaling fit
+# absorbs that rather than revealing it. So the test is that a run chopped
+# into segments lands on exactly the parameters an uninterrupted run does.
+
+
+def _tiny_train_config(**overrides):
+    defaults = dict(
+        batch_size=8, learning_rate=1e-3, warmup_steps=2, total_steps=20,
+        eval_every=5, seed=0, eval_batches=2,
+    )
+    defaults.update(overrides)
+    return TrainConfig(**defaults)
+
+
+def _train_inputs(ingested, feature_table):
+    """A PickData small enough to train on in a test, plus its splits."""
+    from src.data.dataset import split_by_draft
+
+    data, _, _ = ingested(count=60)
+    splits = split_by_draft(data, seed=0)
+    config = ModelConfig(
+        hidden_dim=16, num_heads=2, pool_encoder_layers=1, pack_encoder_layers=1,
+        arm_layers=1, card_feature_dim=data.vocab.size and FEATURE_DIM,
+    )
+    return data, splits, config
+
+
+def test_resume_reproduces_an_uninterrupted_run(tmp_path, ingested, feature_table):
+    """Segmented training must land on the same parameters as one long run."""
+    from src.training.train import train_model
+
+    data, splits, config = _train_inputs(ingested, feature_table)
+    table = jnp.asarray(np.zeros((data.vocab.size, FEATURE_DIM), dtype=np.float32))
+    train_config = _tiny_train_config()
+
+    straight = train_model(
+        data, table, splits.train, splits.val, config, train_config,
+        arm="attention", verbose=False, checkpoint_dir=tmp_path / "straight",
+    )
+    assert straight["completed"] is True
+    assert straight["stopped_at_step"] == train_config.total_steps
+
+    # max_seconds=0 stops at the very first evaluation boundary every time,
+    # so this chops the same run into four segments deterministically.
+    segmented_dir = tmp_path / "segmented"
+    segments = 0
+    while True:
+        result = train_model(
+            data, table, splits.train, splits.val, config, train_config,
+            arm="attention", verbose=False, checkpoint_dir=segmented_dir,
+            resume=True, max_seconds=0.0,
+        )
+        segments += 1
+        if result["completed"]:
+            break
+        assert segments < 10, "segmented run is not making progress"
+
+    assert segments > 1, "the budget never fired; this would not test resume"
+    assert result["stopped_at_step"] == train_config.total_steps
+
+    straight_leaves = jax.tree_util.tree_leaves(straight["params"])
+    resumed_leaves = jax.tree_util.tree_leaves(result["params"])
+    assert len(straight_leaves) == len(resumed_leaves)
+    for a, b in zip(straight_leaves, resumed_leaves):
+        np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+
+    # The curve must be continuous too, not just the endpoint: a resume that
+    # replayed data would still converge, to a different place along the way.
+    assert [h["step"] for h in result["history"]] == [
+        h["step"] for h in straight["history"]
+    ]
+    for got, want in zip(result["history"], straight["history"]):
+        assert got["train_loss"] == pytest.approx(want["train_loss"], abs=1e-6)
+        assert got["val_loss"] == pytest.approx(want["val_loss"], abs=1e-6)
+
+
+def test_batch_stream_restores_its_exact_position(ingested):
+    """The stream is the part of resume that has no shape check to catch it."""
+    from src.training.train import BatchStream
+
+    data, _, _ = ingested(count=60)
+    indices = np.arange(data.size)
+
+    reference = BatchStream(data, indices, batch_size=8, seed=3)
+    consumed = [next(reference) for _ in range(11)]
+    saved = reference.state()
+    expected = [next(reference) for _ in range(5)]
+
+    restored = BatchStream(data, indices, batch_size=8, seed=3)
+    restored.restore(saved)
+    got = [next(restored) for _ in range(5)]
+
+    for want, have in zip(expected, got):
+        for key in want:
+            np.testing.assert_array_equal(want[key], have[key])
+    assert len(consumed) == 11  # the stream really did advance past one epoch
+
+
+def test_resume_refuses_a_run_with_a_different_config(tmp_path, ingested):
+    """A width change must fail loudly rather than continue the loss curve."""
+    from src.training.train import train_model
+
+    data, splits, config = _train_inputs(ingested, None)
+    table = jnp.asarray(np.zeros((data.vocab.size, FEATURE_DIM), dtype=np.float32))
+    out = tmp_path / "cell"
+
+    train_model(
+        data, table, splits.train, splits.val, config, _tiny_train_config(),
+        arm="attention", verbose=False, checkpoint_dir=out, max_seconds=0.0,
+    )
+
+    wider = ModelConfig(**{**config.__dict__, "hidden_dim": 32})
+    with pytest.raises(ValueError, match="different configuration"):
+        train_model(
+            data, table, splits.train, splits.val, wider, _tiny_train_config(),
+            arm="attention", verbose=False, checkpoint_dir=out, resume=True,
+        )
+
+
+def test_finished_run_leaves_no_resume_state(tmp_path, ingested):
+    """Otherwise re-running a completed cell silently does nothing."""
+    from src.training.checkpoint import RESUME_PARAMS_FILE, RESUME_STATE_FILE
+    from src.training.train import train_model
+
+    data, splits, config = _train_inputs(ingested, None)
+    table = jnp.asarray(np.zeros((data.vocab.size, FEATURE_DIM), dtype=np.float32))
+    out = tmp_path / "cell"
+
+    partial = train_model(
+        data, table, splits.train, splits.val, config, _tiny_train_config(),
+        arm="attention", verbose=False, checkpoint_dir=out, max_seconds=0.0,
+    )
+    assert partial["completed"] is False
+    assert (out / RESUME_PARAMS_FILE).exists()
+    assert (out / RESUME_STATE_FILE).exists()
+
+    while not train_model(
+        data, table, splits.train, splits.val, config, _tiny_train_config(),
+        arm="attention", verbose=False, checkpoint_dir=out,
+        resume=True, max_seconds=0.0,
+    )["completed"]:
+        pass
+
+    assert not (out / RESUME_PARAMS_FILE).exists()
+    assert not (out / RESUME_STATE_FILE).exists()

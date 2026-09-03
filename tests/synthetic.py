@@ -35,15 +35,28 @@ COLUMNS = (
 )
 
 
-def write_export(path, drafts, gzipped: bool = True) -> None:
+def write_export(path, drafts, gzipped: bool = True, drop_columns=()) -> None:
     """Writes a format-faithful draft_data_public CSV.
 
     `drafts` is a list of (draft_id, packs), where packs holds
     PACKS_PER_DRAFT lists of card names in the order that drafter took them.
+
+    `drop_columns` omits named metadata columns, because the real exports
+    disagree about which ones they carry: AFR.PremierDraft has no `rank`
+    and no `user_game_win_rate_bucket` at all.
     """
+    drop = set(drop_columns)
+    keep = [i for i, c in enumerate(COLUMNS) if c not in drop]
+
     opener = gzip.open if gzipped else open
     with opener(path, "wt", encoding="utf-8", newline="") as handle:
-        writer = csv.writer(handle)
+        raw = csv.writer(handle)
+
+        class _RowWriter:
+            def writerow(self, row):
+                raw.writerow(row if not drop else [row[i] for i in keep])
+
+        writer = _RowWriter()
         writer.writerow(COLUMNS)
         for draft_id, packs in drafts:
             pool: list[str] = []
@@ -66,17 +79,37 @@ def write_export(path, drafts, gzipped: bool = True) -> None:
                     pool.append(taken[pick_number])
 
 
-def make_draft(rng, draft_id: str):
-    """One well-formed draft: three packs of PICKS_PER_PACK distinct cards."""
+def make_draft(
+    rng,
+    draft_id: str,
+    picks_per_pack: int = PICKS_PER_PACK,
+    packs_per_draft: int = PACKS_PER_DRAFT,
+):
+    """One well-formed draft: `packs_per_draft` packs of distinct cards.
+
+    The geometry is a parameter rather than a constant because the ingest
+    pass is supposed to measure it instead of assuming Arena's usual 3x14
+    -- see src/data/ingest.py::PackGeometry. A test that can only build
+    3x14 exports cannot tell a working detector from a hardcoded 14.
+    """
     packs = [
-        list(rng.choice(CARDS, size=PICKS_PER_PACK, replace=False))
-        for _ in range(PACKS_PER_DRAFT)
+        list(rng.choice(CARDS, size=picks_per_pack, replace=False))
+        for _ in range(packs_per_draft)
     ]
     return (draft_id, packs)
 
 
-def make_drafts(rng, count: int, prefix: str = "draft"):
-    return [make_draft(rng, f"{prefix}{i:04d}") for i in range(count)]
+def make_drafts(
+    rng,
+    count: int,
+    prefix: str = "draft",
+    picks_per_pack: int = PICKS_PER_PACK,
+    packs_per_draft: int = PACKS_PER_DRAFT,
+):
+    return [
+        make_draft(rng, f"{prefix}{i:04d}", picks_per_pack, packs_per_draft)
+        for i in range(count)
+    ]
 
 
 def make_matched_pair(rng):
