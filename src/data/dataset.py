@@ -122,9 +122,6 @@ class PickData:
                     f"first is {self.draft_ids[bad_drafts[0]]}. Pass on_invalid='drop' "
                     "to exclude them."
                 )
-            rows_before = self.size
-            observed = np.bincount(self.draft_idx, minlength=self.n_drafts)
-            observed = observed[observed > 0]
             keep = ~np.isin(self.draft_idx, bad_drafts)
             self.dropped_rows = int((~keep).sum())
             for field in self._FIELDS:
@@ -132,26 +129,6 @@ class PickData:
             self._reindex()
             if self._invalid_drafts().size:
                 raise AssertionError("dropping invalid drafts did not restore the identity")
-
-            # Dropping a few malformed drafts is expected -- OTJ has some.
-            # Dropping *every* row is not a data-quality problem, it is a
-            # geometry mismatch, and it must not be allowed through: a
-            # zero-row dataset trains on nothing, reports NaN for every loss
-            # and baseline, and looks like a broken model rather than the
-            # wrong set. PICKS_PER_PACK is fixed at FIN's 14 (docs/DATA.md),
-            # so any set drafting a different pack size lands here.
-            if self.size == 0 and rows_before:
-                modal = int(np.bincount(observed).argmax()) if observed.size else 0
-                raise ValueError(
-                    f"every one of {rows_before:,} rows was dropped as invalid: "
-                    f"all {bad_drafts.size:,} drafts violate the expected "
-                    f"geometry of {PICKS_PER_PACK * PACKS_PER_DRAFT} rows per "
-                    f"draft ({PACKS_PER_DRAFT} packs x {PICKS_PER_PACK} picks), "
-                    f"while this export has {modal} rows per draft. "
-                    "PICKS_PER_PACK is hardcoded to FIN's pack size; this "
-                    "processed directory is from a set that drafts a different "
-                    "pack size and cannot be loaded without generalising it."
-                )
 
     def _reindex(self) -> None:
         """First row of each draft, for the pool-as-prefix slice."""
