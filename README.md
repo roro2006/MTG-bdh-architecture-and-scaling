@@ -30,9 +30,20 @@ src/
   data/               — dataset pipeline (17lands ingestion, vocab construction)
   models/             — the shared front-end, the attention arm, the BDH arm
   training/           — grid runner, curve fitting, floor measurement
+scripts/              — Colab accelerator scaffolding (remote bootstrap + WSL driver)
 tests/                — pipeline tests, run against a synthetic export (no download needed)
 notebooks/            — exploratory analysis, not part of the pipeline proper
 ```
+
+## Running on an accelerator
+
+The grid does not exist as a CPU workload. To train a cell on a Colab T4 or
+TPU, authenticate once (`colab sessions`, paste the code it prints) and then:
+
+    ./scripts/colab_run.sh --gpu T4 --arm bdh --width 64 --steps 3000
+
+`scripts/README.md` covers the segment loop, data staging and the traps worth
+knowing about before the first run.
 
 ## Data
 
