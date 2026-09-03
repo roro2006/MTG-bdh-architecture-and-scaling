@@ -13,7 +13,18 @@ There's a second piece worth stating plainly, because it's what separates this f
 
 ## Where things stand
 
-Nothing has been trained yet. The data pipeline (`src/data/`) is implemented and tested: vocabulary construction, a streaming ingest that turns the ~9GB raw export into ~267MB of arrays, pool reconstruction, draft-level splitting, and matched-state grouping. Everything else — both model arms, the grid runner, the fitting code — is still a skeleton. Implementation is being built out in stages, each landing as its own commit rather than one dump.
+The data pipeline (`src/data/`) is implemented and tested: vocabulary construction, a streaming ingest that turns the ~9GB raw export into ~267MB of arrays, pool reconstruction, draft-level splitting, and matched-state grouping. Both model arms are ported, instrumented, and now trained end to end at one size. The grid runner, the curve fit, and the floor measurement are still skeletons. Implementation is being built out in stages, each landing as its own commit rather than one dump.
+
+**First real runs, both arms at `d=64`, 3,000 steps, one seed, LR 3e-4** (see `docs/RESULTS.md` for the numbers and what they do and do not license):
+
+| | attention | BDH |
+|---|---|---|
+| parameters | 260,289 | 258,177 |
+| best val loss | 0.9402 | **0.9191** |
+| picks 0–8 only | 1.1473 | **1.1150** |
+| wall clock | 2,745s | 3,363s |
+
+Against baselines of 1.7994 (uniform) and 1.5662 (pick-rate prior), so both arms are learning pool-conditional structure rather than card quality alone. BDH is ahead per parameter and behind per second, which is the iso-parameter/iso-FLOP ambiguity `docs/ARCHITECTURE.md` exists to keep honest — at one width, one seed, and an untuned shared learning rate, it settles neither.
 
 The set under study is **FIN.PremierDraft**: 363 cards, 5,889,954 picks across 140,237 drafts, ingested and sitting at 253MB in RAM.
 
@@ -26,13 +37,26 @@ docs/
   PROJECT_PLAN.md    — stages, scope, grid design, fitting procedure, risks
   ARCHITECTURE.md     — the card/pack/pool encoder design and how BDH plugs into it
   DATA.md             — what data sources are used, what was verified, and why
+  RESULTS.md          — measured numbers, and what they do and do not license
+  COLAB.md            — how the grid is made to fit a free Colab session
 src/
   data/               — dataset pipeline (17lands ingestion, vocab construction)
   models/             — the shared front-end, the attention arm, the BDH arm
   training/           — grid runner, curve fitting, floor measurement
+scripts/              — Colab accelerator scaffolding (remote bootstrap + WSL driver)
 tests/                — pipeline tests, run against a synthetic export (no download needed)
 notebooks/            — exploratory analysis, not part of the pipeline proper
 ```
+
+## Running on an accelerator
+
+The grid does not exist as a CPU workload. To train a cell on a Colab T4 or
+TPU, authenticate once (`colab sessions`, paste the code it prints) and then:
+
+    ./scripts/colab_run.sh --gpu T4 --arm bdh --width 64 --steps 3000
+
+`scripts/README.md` covers the segment loop, data staging and the traps worth
+knowing about before the first run.
 
 ## Data
 
