@@ -366,3 +366,21 @@ def split_by_draft(
             else np.empty(0, dtype=np.int64)
         ),
     )
+
+
+def decision_rows(data: PickData, indices: np.ndarray) -> np.ndarray:
+    """`indices` with the forced picks removed.
+
+    A pack holding one card admits one answer, so its cross-entropy is
+    identically zero for *every* parameter value and its gradient is
+    identically zero with it. Those rows cannot teach the model anything;
+    they only occupy a slot in a batch. On FIN that is 336,567 of the
+    4,711,938 training rows -- 7.14%, one row in fourteen, because each of
+    the three packs ends in exactly one forced pick.
+
+    This is for the training stream only. Evaluation keeps them: they are
+    part of the task, `evaluate_by_pick` reports them separately, and
+    dropping them there would change what the reported loss means. See
+    docs/RESULTS.md on why the two populations have to stay distinguishable.
+    """
+    return indices[data.pack_size[indices] > 1]
