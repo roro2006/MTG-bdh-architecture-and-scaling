@@ -5,7 +5,15 @@ the pool at any pick is exactly the set of that draft's earlier picks. Once
 rows are sorted into canonical order -- (draft_idx, pack_number, pick_number)
 -- that becomes a slice rather than a computation: row i's pool is
 `label[draft_start[i] : i]`. That identity is asserted on load against the
-independently known pool size, `pack_number * PICKS_PER_PACK + pick_number`.
+independently known pool size,
+`pack_number * geometry.picks_per_pack + pick_number`.
+
+That formula is why pack geometry cannot be a constant here. Ingest
+measures it per set and records it in ingest_stats.json (see
+ingest.PackGeometry); PickData reads it back. With a hardcoded 14 a set
+drafting some other number of picks per pack would fail the identity on
+every row, and the default `on_invalid="drop"` would then throw the whole
+corpus away without raising anything.
 
 Responsibilities (see docs/PROJECT_PLAN.md sections 1-2):
   - parse per-pick examples: pack contents, accumulated pool, pack/pick
@@ -23,14 +31,19 @@ from pathlib import Path
 
 import numpy as np
 
-from .ingest import MAX_PACK_SIZE  # noqa: F401  (re-exported: pack width for callers)
+from .ingest import PackGeometry, load_geometry
 from .vocab import Vocabulary
 
-PICKS_PER_PACK = 14
-PACKS_PER_DRAFT = 3
+# Arena's usual shape, and the fallback when a corpus predates the geometry
+# record. These are DEFAULTS, not facts about a corpus: read the real
+# numbers off `PickData.geometry`, which comes from the export itself.
+DEFAULT_GEOMETRY = PackGeometry(packs_per_draft=3, picks_per_pack=14, max_pack_size=14)
 
+PICKS_PER_PACK = DEFAULT_GEOMETRY.picks_per_pack
+PACKS_PER_DRAFT = DEFAULT_GEOMETRY.packs_per_draft
+MAX_PACK_SIZE = DEFAULT_GEOMETRY.max_pack_size
 # Largest pool a draft ever presents: everything taken before the final pick.
-MAX_POOL_SIZE = (PACKS_PER_DRAFT - 1) * PICKS_PER_PACK + (PICKS_PER_PACK - 1)
+MAX_POOL_SIZE = DEFAULT_GEOMETRY.max_pool_size
 
 PAD_ID = -1
 
@@ -90,6 +103,8 @@ class PickData:
         arrays: dict[str, np.ndarray],
         vocab: Vocabulary,
         on_invalid: str = "drop",
+        geometry: PackGeometry | None = None,
+        max_dropped_fraction: float = 0.5,
     ):
         if on_invalid not in ("drop", "raise"):
             raise ValueError(f"on_invalid must be 'drop' or 'raise', got {on_invalid!r}")
@@ -108,6 +123,18 @@ class PickData:
         self.draft_ids = arrays["draft_ids"]
         self.rank_names = arrays["rank_names"]
         self.vocab = vocab
+        # Prefer what ingest measured. Inferring from the arrays is a
+        # fallback, and a weaker one: it reads the observed extent, so a
+        # corpus that happens to hold no final-pick rows would under-report.
+        if geometry is None:
+            geometry = (
+                PackGeometry.from_arrays(
+                    self.pack_number, self.pick_number, int(self.pack.shape[1])
+                )
+                if self.label.size
+                else DEFAULT_GEOMETRY
+            )
+        self.geometry = geometry
 
         self.n_drafts = int(self.draft_idx.max()) + 1 if self.size else 0
         self._reindex()
@@ -122,13 +149,49 @@ class PickData:
                     f"first is {self.draft_ids[bad_drafts[0]]}. Pass on_invalid='drop' "
                     "to exclude them."
                 )
+            rows_before = int(self.draft_idx.size)
             keep = ~np.isin(self.draft_idx, bad_drafts)
             self.dropped_rows = int((~keep).sum())
+            if self.dropped_rows > max_dropped_fraction * max(rows_before, 1):
+                raise ValueError(self._mass_drop_diagnosis(bad_drafts, rows_before))
             for field in self._FIELDS:
                 setattr(self, field, getattr(self, field)[keep])
             self._reindex()
             if self._invalid_drafts().size:
                 raise AssertionError("dropping invalid drafts did not restore the identity")
+
+    def _mass_drop_diagnosis(self, bad_drafts: np.ndarray, rows_before: int) -> str:
+        """Says *why* a corpus is about to disappear, rather than emptying it.
+
+        Dropping a few malformed drafts is routine. Dropping most of them
+        means the corpus does not have the shape this loader believes it
+        has, and the default `on_invalid="drop"` would otherwise hand back
+        an empty PickData with no explanation -- the exact silent failure
+        the geometry work exists to prevent.
+
+        The single most useful fact is the modal number of rows per draft:
+        AFR.PremierDraft has 41 where 3x14 predicts 42, because its export
+        omits every draft's very first pick.
+        """
+        counts = np.bincount(self.draft_idx, minlength=self.n_drafts)
+        counts = counts[counts > 0]
+        modal = int(np.bincount(counts).argmax()) if counts.size else 0
+        expected = self.geometry.picks_per_draft
+        note = ""
+        if modal and modal != expected:
+            note = (
+                f" Most drafts have {modal} rows where this geometry predicts "
+                f"{expected}; the export is probably missing "
+                f"{expected - modal} pick(s) per draft rather than being "
+                "the geometry recorded."
+            )
+        return (
+            f"{self.dropped_rows:,} of {rows_before:,} rows "
+            f"({self.dropped_rows / max(rows_before, 1):.1%}) belong to drafts that "
+            f"violate the pool-as-prefix identity at geometry "
+            f"{self.geometry.describe()}.{note} Refusing to return a corpus that "
+            "is mostly gone -- pass max_dropped_fraction=1.0 to accept it anyway."
+        )
 
     def _reindex(self) -> None:
         """First row of each draft, for the pool-as-prefix slice."""
@@ -140,13 +203,39 @@ class PickData:
     def size(self) -> int:
         return int(self.label.size)
 
+    @property
+    def picks_per_pack(self) -> int:
+        return self.geometry.picks_per_pack
+
+    @property
+    def packs_per_draft(self) -> int:
+        return self.geometry.packs_per_draft
+
+    @property
+    def max_pool_size(self) -> int:
+        return self.geometry.max_pool_size
+
     @classmethod
-    def load(cls, processed_dir: str | Path, on_invalid: str = "drop") -> "PickData":
+    def load(
+        cls,
+        processed_dir: str | Path,
+        on_invalid: str = "drop",
+        max_dropped_fraction: float = 0.5,
+    ) -> "PickData":
+        """Loads a processed directory, taking its geometry from
+        ingest_stats.json when that file records one.
+        """
         processed_dir = Path(processed_dir)
         with np.load(processed_dir / "picks.npz") as handle:
             arrays = {name: handle[name] for name in handle.files}
         vocab = Vocabulary.load(processed_dir / "vocab.json")
-        return cls(arrays, vocab, on_invalid=on_invalid)
+        return cls(
+            arrays,
+            vocab,
+            on_invalid=on_invalid,
+            geometry=load_geometry(processed_dir),
+            max_dropped_fraction=max_dropped_fraction,
+        )
 
     def _invalid_drafts(self) -> np.ndarray:
         """Drafts where the pool-as-prefix identity does not hold.
@@ -161,7 +250,7 @@ class PickData:
         if self.size == 0:
             return np.empty(0, dtype=np.int64)
         expected = (
-            self.pack_number.astype(np.int64) * PICKS_PER_PACK
+            self.pack_number.astype(np.int64) * self.geometry.picks_per_pack
             + self.pick_number.astype(np.int64)
         )
         actual = np.arange(self.size, dtype=np.int64) - self._draft_start[self.draft_idx]
@@ -169,7 +258,9 @@ class PickData:
         # A draft can also be short without breaking the prefix identity
         # (truncated at the end), which still leaves an incomplete draft.
         counts = np.bincount(self.draft_idx, minlength=self.n_drafts)
-        short = np.flatnonzero((counts > 0) & (counts != PICKS_PER_PACK * PACKS_PER_DRAFT))
+        short = np.flatnonzero(
+            (counts > 0) & (counts != self.geometry.picks_per_draft)
+        )
         return np.union1d(np.unique(self.draft_idx[bad]), short)
 
     def pool_of(self, i: int) -> np.ndarray:
@@ -177,7 +268,7 @@ class PickData:
         return self.label[self._draft_start[self.draft_idx[i]] : i]
 
     def pools_padded(self, indices: np.ndarray) -> np.ndarray:
-        """(len(indices), MAX_POOL_SIZE) int16, PAD_ID-padded, for a batch.
+        """(len(indices), geometry.max_pool_size) int16, PAD_ID-padded.
 
         Built by gathering, not by looping: each row's pool is a fixed
         offset back from its own position, so one broadcast gather covers
@@ -186,7 +277,7 @@ class PickData:
         indices = np.asarray(indices, dtype=np.int64)
         starts = self._draft_start[self.draft_idx[indices]]
         lengths = indices - starts
-        offsets = np.arange(MAX_POOL_SIZE, dtype=np.int64)[None, :]
+        offsets = np.arange(self.geometry.max_pool_size, dtype=np.int64)[None, :]
         gather = starts[:, None] + offsets
         valid = offsets < lengths[:, None]
         out = np.where(valid, self.label[np.clip(gather, 0, self.size - 1)], PAD_ID)
@@ -249,7 +340,8 @@ def matched_state_groups(data: PickData, min_drafts: int = 2) -> tuple[np.ndarra
     next_group = 0
 
     bucket_key = (
-        data.pack_number.astype(np.int64) * PICKS_PER_PACK + data.pick_number
+        data.pack_number.astype(np.int64) * data.geometry.picks_per_pack
+        + data.pick_number
     )
     for bucket in np.unique(bucket_key):
         rows = np.flatnonzero(bucket_key == bucket)
