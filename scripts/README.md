@@ -99,10 +99,12 @@ value silently falls back to A100, so the driver validates locally first.
 **An unstopped session bills indefinitely.** Teardown runs from a `trap`, so it
 happens on error and interrupt too, not only on success.
 
-**Not every set loads.** `PICKS_PER_PACK` is hardcoded to FIN's 14
-(`docs/DATA.md`), so of the ten ingested sets, BLB and EOE (13 picks) and LCI
-and SIR (15) drop every row. `PickData` now raises a geometry error rather than
-handing back an empty dataset that trains on nothing and reports NaN.
+**Pack geometry is measured, not assumed** -- which is what makes `--set`
+meaningful. Arena's usual shape is 3x14, but four of the ten sets ingested so
+far do not use it: BLB and EOE draft 13-card packs, LCI and SIR draft 15.
+Ingest records the geometry it saw in `ingest_stats.json`, `PickData` reads it
+back, and `ModelConfig` is sized from the corpus. Staging a set whose export
+predates that record still works -- the geometry is inferred from the arrays.
 
 ## Checking a run is real
 
