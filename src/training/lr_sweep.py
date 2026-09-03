@@ -60,7 +60,10 @@ def sweep(
     records: list[dict] = []
     for width in widths:
         model_config = ModelConfig(
-            hidden_dim=width, card_feature_dim=int(feature_table.shape[1])
+            hidden_dim=width,
+            card_feature_dim=int(feature_table.shape[1]),
+            packs_per_draft=data.packs_per_draft,
+            picks_per_pack=data.picks_per_pack,
         )
         for rate in learning_rates:
             train_config = TrainConfig(
