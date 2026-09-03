@@ -256,3 +256,156 @@ def test_loss_matches_a_hand_computed_softmax(feature_table):
     expected_1 = -np.log(1.0 / 3.0)
     assert float(loss) == pytest.approx((expected_0 + expected_1) / 2, abs=1e-5)
     assert float(accuracy) == pytest.approx(0.5)
+
+
+def test_collect_density_reaches_the_arm_through_the_full_model(feature_table, rng):
+    """The plumbing, not the measurement.
+
+    `measure_density` already worked on a bare BDHArm, but the thing that
+    gets trained is a whole PickModel and its arm inputs are encoder
+    outputs, so they cannot be synthesised. Unless the flag actually
+    reaches the arm, PROJECT_PLAN.md 3a's sparsity condition can only ever
+    be checked on an initialised model, where it is vacuous.
+
+    Asserting the collection is non-empty is the load-bearing half: a flag
+    that silently failed to plumb through would leave `mutable=["density"]`
+    returning an empty dict, and a caller averaging over nothing would
+    report a density rather than an error.
+    """
+    config = replace(_config(), collect_density=True)
+    model, variables = init_model(config, feature_table, arm="bdh", seed=0)
+    batch = _batch(rng)
+
+    _, state = model.apply(
+        {"params": variables["params"]}, feature_table,
+        jnp.asarray(batch["pack_ids"]), jnp.asarray(batch["pool_ids"]),
+        jnp.asarray(batch["pack_number"]), jnp.asarray(batch["pick_number"]),
+        mutable=["density"],
+    )
+
+    assert "density" in state
+    leaves = jax.tree_util.tree_leaves(state["density"])
+    assert leaves, "collect_density did not reach the arm"
+    # One (B, L_pack) row per key per block: three keys, arm_layers blocks.
+    assert len(leaves) == 3 * config.arm_layers
+    assert all(leaf.shape == (len(batch["pack_ids"]), MAX_PACK) for leaf in leaves)
+
+
+def test_sow_appends_so_the_density_collection_must_not_be_fed_back(
+    feature_table, rng
+):
+    """Why src/training/density.py applies against the weights alone.
+
+    `sow` appends to whatever the collection already holds. Hand `apply` a
+    variables dict that still carries a density collection and the tuples
+    grow by one per batch, with the stale entry sitting in front -- so a
+    reader taking element 0 would report the *initialised* density forever,
+    which is exactly the number the measurement exists to avoid, and it
+    would look entirely plausible.
+    """
+    config = replace(_config(), collect_density=True)
+    model, variables = init_model(config, feature_table, arm="bdh", seed=0)
+    batch = _batch(rng)
+    args = (
+        feature_table,
+        jnp.asarray(batch["pack_ids"]), jnp.asarray(batch["pool_ids"]),
+        jnp.asarray(batch["pack_number"]), jnp.asarray(batch["pick_number"]),
+    )
+
+    # init itself already returns a density collection alongside the params.
+    assert "density" in variables
+
+    _, fed_back = model.apply(variables, *args, mutable=["density"])
+    grown = jax.tree_util.tree_leaves(fed_back["density"])
+    assert len(grown) == 2 * 3 * config.arm_layers
+
+    _, clean = model.apply(
+        {"params": variables["params"]}, *args, mutable=["density"]
+    )
+    assert len(jax.tree_util.tree_leaves(clean["density"])) == 3 * config.arm_layers
+
+
+def test_collect_density_changes_no_parameters(feature_table):
+    """So a checkpoint stays readable either way.
+
+    The flag is instrumentation: it adds reductions, not weights. If it
+    ever perturbed the tree, a model trained without it could not be
+    measured with it, which is the only way anyone wants to use it.
+    """
+    off = _config()
+    on = replace(off, collect_density=True)
+    _, variables_off = init_model(off, feature_table, arm="bdh", seed=0)
+    _, variables_on = init_model(on, feature_table, arm="bdh", seed=0)
+
+    # The *params* collection is what a checkpoint holds and what the
+    # scaling law's N counts; the density collection rides alongside it and
+    # is not a parameter.
+    assert jax.tree_util.tree_structure(
+        variables_off["params"]
+    ) == jax.tree_util.tree_structure(variables_on["params"])
+    assert count_params_actual(variables_off) == count_params_actual(variables_on)
+    assert count_params_analytic(off, "bdh") == count_params_analytic(on, "bdh")
+
+    # Same seed, same initialiser draw: instrumentation must not consume
+    # randomness or the measured model would not be the trained one.
+    for a, b in zip(
+        jax.tree_util.tree_leaves(variables_off["params"]),
+        jax.tree_util.tree_leaves(variables_on["params"]),
+    ):
+        assert np.array_equal(np.asarray(a), np.asarray(b))
+
+
+def test_count_params_actual_ignores_non_parameter_collections(feature_table):
+    """N is the params collection, not everything flax hands back.
+
+    This is the assertion that makes the scaling law's N mean what the
+    fit assumes. A sown collection holds activations shaped by the batch
+    that built the tree, so counting it would make N depend on a dummy
+    input -- a wrong N that still looks like a plausible number, and an
+    alpha bent by it that still looks like a plausible exponent.
+    """
+    config = _config()
+    _, variables = init_model(config, feature_table, arm="bdh", seed=0)
+    expected = count_params_analytic(config, "bdh")["total"]
+    assert count_params_actual(variables) == expected
+
+    # Any non-parameter collection would do; flax puts batch_stats and sown
+    # values alongside params in exactly this shape.
+    with_extra = dict(variables)
+    with_extra["batch_stats"] = {"arm": {"running": jnp.zeros((512, 14))}}
+    assert count_params_actual(with_extra) == expected
+
+    # A bare params tree, which is what a restored checkpoint hands back,
+    # has to count the same.
+    assert count_params_actual(variables["params"]) == expected
+
+
+def test_a_forced_pick_contributes_no_gradient(feature_table, rng):
+    """The premise behind dropping forced rows from training.
+
+    A one-card pack has exactly one admissible answer, so its loss is zero
+    whatever the parameters are -- and a loss that is constant in the
+    parameters has zero derivative with respect to all of them. That is
+    what makes dropping these rows free rather than a trade: they are not
+    cheap signal, they are no signal.
+
+    Asserted on the gradient rather than on the loss, because a zero loss
+    would also be produced by a model that had merely learned these rows,
+    and only the gradient distinguishes "already fitted" from "unfittable".
+    """
+    model, params = init_model(_config(), feature_table, arm="bdh", seed=0)
+    batch = _batch(rng, batch_size=4, pack_sizes=[1, 1, 1, 1])
+
+    def loss_fn(p):
+        logits = model.apply(
+            p, feature_table,
+            jnp.asarray(batch["pack_ids"]), jnp.asarray(batch["pool_ids"]),
+            jnp.asarray(batch["pack_number"]), jnp.asarray(batch["pick_number"]),
+        )
+        return cross_entropy_loss(logits, jnp.zeros(4, dtype=jnp.int32))[0]
+
+    assert float(loss_fn(params)) == pytest.approx(0.0, abs=1e-6)
+    grads = jax.tree_util.tree_leaves(jax.grad(loss_fn)(params))
+    assert grads
+    worst = max(float(jnp.abs(g).max()) for g in grads)
+    assert worst == pytest.approx(0.0, abs=1e-9), f"largest |grad| was {worst}"
