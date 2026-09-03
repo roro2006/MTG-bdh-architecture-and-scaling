@@ -1,14 +1,50 @@
 # Running a cell on a Colab accelerator
 
-Everything in this project has run CPU-only, and at 25.6 GFLOP/s the grid in
-`docs/PROJECT_PLAN.md` §4 is not a workload that exists. These two scripts are
-how a cell runs on a T4 or a TPU instead.
+CPU-only, at 25.6 GFLOP/s, the grid in `docs/PROJECT_PLAN.md` §4 is not a
+workload that exists. These two scripts are how a cell runs on a T4 instead --
+and, by design though not yet in practice, on a TPU.
 
     ./scripts/colab_run.sh --gpu T4 --arm bdh --width 64 --steps 3000
 
 That provisions a runtime, stages the data, trains, pulls the artefacts back
 into `runs/<run-name>/`, and tears the session down. One command, no browser
 step after the one-time authentication below.
+
+## What has actually been run on hardware
+
+Until 2026-09-03 neither script had ever been exercised against a real
+accelerator. The path described here was designed, reviewed and unproven. It
+has now been run end to end, and the numbers below are measured rather than
+predicted.
+
+One T4 session, `--gpu T4 --arm bdh --width 64 --steps 3000`, on FIN, at commit
+`c169f60`:
+
+| | |
+|---|---|
+| throughput, steady state | ~18,400 ex/s |
+| throughput, whole run including JIT warmup | 15,291 ex/s |
+| CPU baseline it replaces | 561 ex/s |
+| training, 3,000 steps | 100s (CPU reference for this cell: 3,363s) |
+| staging: 216MB download, then ingest | 16s, then 199s |
+| whole driver invocation, provision to teardown | 8m 16s |
+| segments used | 1 of 24 |
+
+So roughly **33x** the CPU throughput once the JIT warmup is amortised. The
+2.3 h/epoch that `docs/PROJECT_PLAN.md` section 9 names as the binding
+constraint on everything downstream becomes about five minutes.
+
+Confirmed working in that run: provisioning, the pushed-HEAD preflight, the
+generated remote invocation, the backend probe both before and after installing
+dependencies, staging from the 17lands export, training, `STATUS.json`,
+artefact download into `runs/<name>/`, session-log export, and teardown from the
+trap.
+
+Still unexercised, and so still only designed: the multi-segment resume path
+(this cell finished inside one 30-minute segment, so `--resume` was passed but
+never had state to restore), `--cache-dir`, TPU runtimes, and `--fused-kernels`.
+Re-running the kernel tests with `KERNEL_INTERPRET=0` is also still pending --
+the bootstrap has no pytest path, and one was deliberately not improvised.
 
 ## Authenticate once
 
@@ -20,6 +56,17 @@ and reused, so this is the only interactive step in the workflow. It works from
 WSL precisely because it is a paste-the-code flow and needs no local browser and
 no `gcloud`; the scopes it requests already include `colaboratory`, so the
 keep-alive daemon will not 403 later.
+
+Pin the CLI's own dependency when you install it:
+
+    uv tool install --force google-colab-cli --with "jupyter-kernel-client==0.15.0"
+
+`google-colab-cli` 0.6.0 requires `jupyter-kernel-client` with no upper bound,
+and that package renamed `KernelClient` to `JupyterKernelClient` in 1.0.0. Left
+to resolve freely it picks up 1.0.2, and then every `colab exec` dies with
+`AttributeError: module 'jupyter_kernel_client' has no attribute
+'KernelClient'` -- *after* provisioning a session, so it costs a runtime to
+discover. 0.15.0 is the last release the CLI can drive.
 
 ## Why two files rather than one
 
@@ -62,8 +109,9 @@ treats the CLI's own status as a hint.
 ## Data staging, and why Drive over GCS
 
 Cloning gets code and nothing else. By default the bootstrap downloads the raw
-export from 17lands on the VM and ingests it there -- about 206MB and ~283s for
-FIN, paid once per session, on a link far faster than a home connection.
+export from 17lands on the VM and ingests it there -- measured at 216MB in 16s
+and a 199s ingest for FIN, paid once per session, on a link far faster than a
+home connection.
 
 `--cache-dir` opts into caching the processed set so later sessions restore it
 instead of re-ingesting. Point it at a Drive mount. Drive rather than GCS
@@ -88,6 +136,18 @@ have measured nothing. The bootstrap filters both out and re-probes the backend
 afterwards, in a fresh subprocess, since a process that already imported jax
 would keep reporting the version it imported first.
 
+**Colab's own flax can be older than Colab's own jax.** The image that ran the
+measurement above shipped jax 0.11.1 beside a flax predating 0.12.7, whose
+`flax/core/tracers.py` calls `jax.core.get_opaque_trace_state` unconditionally
+-- a function removed in jax 0.11.0. The cell reaches `model.init()` and dies
+there, having already paid for the download and the ingest. A bare
+`pip install flax` does not save you: with any flax present pip answers
+"already satisfied" and leaves the stale one exactly where it is. So the
+bootstrap installs flax and optax with `--upgrade`, under a constraint file
+pinning jax and jaxlib to the versions the arrival probe found on the VM --
+otherwise the upgrade could satisfy itself by pulling the accelerated build out
+from under the run, which is the same clobber arriving down a dependency edge.
+
 **The runtime clones from GitHub**, so anything unpushed does not exist there.
 The driver refuses to run with a dirty tree or unpushed commits, and pins
 `--ref` to the exact SHA it verified rather than to `origin/main`, so a push
@@ -108,18 +168,32 @@ predates that record still works -- the geometry is inferred from the arrays.
 
 ## Checking a run is real
 
-Sanity numbers on the FIN val split, which any correct run reproduces:
+The uniform baseline is a property of the pack geometry alone, so it is the one
+number a correct run has to reproduce exactly:
 
 | | |
 |---|---|
-| uniform baseline | 1.7994 |
-| pick-rate prior | 1.5683 |
-| attention, d=64, 3000 steps | ~0.9323 all-picks |
-| BDH, same config | ~0.9080 |
+| uniform baseline, FIN | 1.7994 |
+| pick-rate prior, FIN | 1.5662 |
 
-Reference CPU wall clock for that config: attention 2745s, BDH 3363s. The
-speedup on an accelerator should be obvious immediately; if it is not,
-something has fallen back to CPU and the backend probe in the log will say so.
+Loss numbers are **not** comparable across the representation rebuild. Every
+result predating it used a 65-column card feature table; the table is 119
+columns now (15 fixed keywords + 73 mechanics). A run today therefore starts a
+new series rather than continuing the old one, and the figures in
+`docs/RESULTS.md` should not be read against it.
 
-A Colab run landing far from these numbers means something is wrong in the port
-or the staging. It is not a thing to average away.
+Post-rebuild, from the T4 run above (BDH, d=64, 3,000 steps -- which is 0.326
+of an epoch, not a converged model):
+
+| | |
+|---|---|
+| all picks | 0.8814 (acc 0.6638, 589,008 rows) |
+| picks 0-8, the headline slice | 1.0806 (acc 0.5997, 378,648 rows) |
+| best sampled val | 0.8846 at step 2,750 |
+
+Pick 13 is forced -- one card left, loss identically 0 -- and is 7.1% of the
+val split, which is why the all-picks figure sits below every individual
+decision pick.
+
+A run landing far from the uniform baseline means something is wrong in the
+port or the staging. It is not a thing to average away.

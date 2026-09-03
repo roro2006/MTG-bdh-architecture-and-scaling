@@ -51,6 +51,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 from pathlib import Path
@@ -74,6 +75,21 @@ PROCESSED_MARKERS = ("picks.npz", "vocab.json", "card_features.npz")
 
 # Dropped from requirements.txt on the VM -- see the module docstring.
 ACCELERATOR_OWNED = {"jax", "jaxlib"}
+
+# Installed with --upgrade rather than accepted as-is. These bind to jax's own
+# internals, so the runtime's preinstalled copy has to match the runtime's jax
+# -- and a bare `pip install flax` does not ensure that. With any flax already
+# present pip reports "already satisfied" and leaves the stale one in place.
+#
+# Not hypothetical. A Colab T4 image shipping jax 0.11.1 alongside flax 0.12.6
+# or older dies at model.init() with
+#     AttributeError: jax.core.get_opaque_trace_state was deprecated in JAX
+#     v0.10.0 and removed in JAX v0.11.0
+# because flax/core/tracers.py calls that unconditionally until 0.12.7, which
+# switched to jax.extend.core with a fallback. The failure lands *after* the
+# 206MB download and the ~213s ingest have already been paid for, so it costs
+# a whole provision to discover.
+JAX_COUPLED = {"flax", "optax"}
 
 # Mirrors RESUME_PARAMS_FILE / RESUME_STATE_FILE in src/training/checkpoint.py.
 # Duplicated rather than imported on purpose: importing that module would pull
@@ -219,15 +235,25 @@ def _git(repo: Path, *args: str) -> str:
 # --------------------------------------------------------------------------
 
 
-def install_requirements(repo: Path) -> list[str]:
+def install_requirements(
+    repo: Path, runtime_pins: dict[str, str | None]
+) -> list[str]:
     """Installs requirements.txt minus anything the runtime already owns.
 
     Returns the list of skipped lines so STATUS.json records what was left
     alone. See the module docstring for why this filtering is load-bearing
     rather than an optimisation.
+
+    Three buckets, not two. jax/jaxlib are skipped outright -- the runtime's
+    accelerated build is the entire reason for being on this machine. The
+    jax-coupled packages are forced to upgrade, because "already satisfied" is
+    precisely the wrong answer when the preinstalled copy predates the
+    runtime's jax. Everything else installs the ordinary way.
     """
     path = repo / "requirements.txt"
-    wanted, skipped = [], []
+    plain: list[str] = []
+    coupled: list[str] = []
+    skipped: list[str] = []
     for raw in path.read_text(encoding="utf-8").splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
@@ -235,7 +261,13 @@ def install_requirements(repo: Path) -> list[str]:
         name = line.split("[")[0]
         for sep in ("==", ">=", "<=", "~=", ">", "<", "!="):
             name = name.split(sep)[0]
-        (skipped if name.strip().lower() in ACCELERATOR_OWNED else wanted).append(line)
+        name = name.strip().lower()
+        if name in ACCELERATOR_OWNED:
+            skipped.append(line)
+        elif name in JAX_COUPLED:
+            coupled.append(line)
+        else:
+            plain.append(line)
 
     if skipped:
         print(
@@ -243,10 +275,30 @@ def install_requirements(repo: Path) -> list[str]:
             "generic wheels would replace the accelerated build with CPU ones",
             flush=True,
         )
-    print(f"  installing: {', '.join(wanted)}", flush=True)
-    subprocess.run(
-        [sys.executable, "-m", "pip", "install", "--quiet", *wanted], check=True
-    )
+
+    # An upgrade must not be free to satisfy itself by moving jax: that is the
+    # same clobber the skip above prevents, arriving down a dependency edge
+    # rather than a requirements line. Pinning both to what is already on the
+    # VM makes that a resolver error instead of a silent fall back to CPU
+    # wheels -- loud and immediate, rather than a run that measures nothing.
+    pins = [f"{name}=={version}" for name, version in runtime_pins.items() if version]
+    pip = [sys.executable, "-m", "pip", "install", "--quiet"]
+    if pins:
+        constraints = Path(tempfile.gettempdir()) / "colab-runtime-constraints.txt"
+        constraints.write_text("\n".join(pins) + "\n", encoding="utf-8")
+        pip += ["--constraint", str(constraints)]
+        print(f"  holding the runtime's {', '.join(pins)}", flush=True)
+
+    if plain:
+        print(f"  installing: {', '.join(plain)}", flush=True)
+        subprocess.run([*pip, *plain], check=True)
+    if coupled:
+        print(
+            f"  upgrading: {', '.join(coupled)} -- these bind to jax's internals "
+            "and the runtime's preinstalled copy may predate its jax",
+            flush=True,
+        )
+        subprocess.run([*pip, "--upgrade", *coupled], check=True)
     return skipped
 
 
@@ -591,7 +643,9 @@ def main(argv: list[str] | None = None) -> int:
         print("[deps] skipped (--skip-install)", flush=True)
     else:
         print("[deps] installing requirements.txt", flush=True)
-        skipped = install_requirements(repo)
+        skipped = install_requirements(
+            repo, {"jax": before.get("jax"), "jaxlib": before.get("jaxlib")}
+        )
 
     after = probe_backend()
     report_backend("hw", after)
