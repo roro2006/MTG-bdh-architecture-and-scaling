@@ -19,9 +19,10 @@ Responsibilities (see docs/PROJECT_PLAN.md sections 1-2):
   - parse per-pick examples: pack contents, accumulated pool, pack/pick
     number, and the label (the card taken)
   - split on draft_id so every pick from one draft stays in a single split
-  - carve out the matched-state subset (recurring pack/pool combinations
-    across distinct drafts) used later for the Bayes-error floor
-    measurement, before the train/val/test split is drawn
+  - optionally carve out a matched-state subset (recurring pack/pool
+    combinations across distinct drafts) before the train/val/test split is
+    drawn. This is a general held-out-subset mechanism; nothing in the
+    current plan consumes it.
 """
 
 from __future__ import annotations
@@ -324,8 +325,14 @@ def matched_state_groups(data: PickData, min_drafts: int = 2) -> tuple[np.ndarra
     across at least `min_drafts` distinct drafts.
 
     Returns (row_indices, group_ids) where group_ids labels which recurring
-    state each returned row belongs to. This is the input to the human
-    disagreement measurement in PROJECT_PLAN.md section 6.
+    state each returned row belongs to. Nothing in the current plan consumes
+    this; it remains as a general mechanism for holding out a subset defined
+    by state recurrence rather than by draft id.
+
+    Worth knowing before building on it: measured on the full FIN corpus,
+    exact recurrence of this state key is *zero* across all 5,889,954 picks.
+    A pool of even two cards is already a near-unique fingerprint, so any use
+    of this needs a relaxed key, not just more data.
 
     States can only collide within the same (pack_number, pick_number) --
     pool size is determined by those two -- so the comparison is bucketed
