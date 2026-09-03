@@ -9,6 +9,13 @@ free Colab T4 instead.
 Two of the changes below cut wasted arithmetic and cost nothing. One cuts
 the experiment itself and states what it gives up. One is hardware.
 
+> **How to actually run it:** `scripts/`, not the notebook. This document is
+> the budget -- which cells are worth running and what they should cost --
+> and `scripts/README.md` is the mechanism. The notebook referenced in §4
+> predates the CLI-driven scaffolding and is kept for its calibration cell;
+> `scripts/colab_run.sh` is what runs a cell today, and it asserts the
+> accelerator for the same reason the notebook did.
+
 ## Where it stands
 
 | | cells | at 3 TFLOP/s (T4 fp32) | largest cell |
@@ -94,11 +101,16 @@ retrained would otherwise return identical-looking results.
 Everything above is a ~2x saving on a workload that is ~1000x too slow on
 CPU. Get on a GPU first; do the rest once you are there.
 
-`notebooks/colab_grid.ipynb` drives the whole thing. Two of its cells earn
-their place:
+`notebooks/colab_grid.ipynb` was how this was driven first. `scripts/` has
+since replaced it -- a notebook cannot be preflighted, resumed, or told to
+tear its own VM down -- but two of its cells earn their place, and both
+survive in the scaffolding:
 
 **It asserts the GPU.** A JAX install that silently falls back to CPU costs
 about 100x, and the grid then looks merely slow rather than misconfigured.
+`colab_bootstrap.py` refuses to train on CPU for exactly this reason, and
+re-probes the backend after installing, since `requirements.txt` names bare
+`jax` and `jaxlib` and pip would otherwise replace the accelerated build.
 
 **It calibrates before it budgets.** Every hour-estimate here is a FLOP
 roofline, and a roofline misprices anything bound by memory traffic or
