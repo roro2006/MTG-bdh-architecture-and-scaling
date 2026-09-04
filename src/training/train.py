@@ -417,7 +417,11 @@ def train_model(
         "train_config": asdict(train_config),
         "best_val_loss": best_val,
         "best_step": best_step,
-        "elapsed_s": time.monotonic() - started,
+        # The whole run, not this segment: a resumed cell would otherwise
+        # report the last segment's slice as if it were the total, and the
+        # throughput derived from it -- examples over elapsed -- is the
+        # number the grid in docs/PROJECT_PLAN.md is planned against.
+        "elapsed_s": _elapsed(),
         "model": model,
         "params": params,
         "best_params": best_params,

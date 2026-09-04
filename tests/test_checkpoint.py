@@ -368,5 +368,10 @@ def test_segment_budget_is_per_segment_not_cumulative(tmp_path, ingested, featur
         "spent; the budget is being charged the previous segments' time"
     )
     assert resumed["stopped_at_step"] == train_config.total_steps
-    # The history stays cumulative -- the fix must not reset that too.
+    # The history stays cumulative -- the fix must not reset that too, and
+    # the reported total must agree with it rather than with this segment.
     assert resumed["history"][-1]["elapsed_s"] > 36_000.0
+    assert resumed["elapsed_s"] > 36_000.0, (
+        "elapsed_s reports only the last segment; throughput computed from "
+        "it would overstate the run by the number of segments"
+    )
