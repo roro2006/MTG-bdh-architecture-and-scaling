@@ -8,7 +8,7 @@ The single-cell runner, the pilot grid, and the curve fit for $L(N, D) = E + A/N
 | `evaluate.py` | exact full-split eval + per-pick breakdown | done |
 | `checkpoint.py` | save/restore params + metadata | done |
 | `run.py` | CLI entry point for a single cell | done |
-| `grid.py` | the sweep | not started |
+| `grid.py` | the sweep | designed and tested, not yet run |
 | `scaling_fit.py` | the curve fit | not started |
 
 ## The fit is a sizing procedure
@@ -20,7 +20,10 @@ It follows Chinchilla's robust procedure: Huber loss on log-residuals rather tha
 ## Running one cell
 
     python -m src.training.run --processed-dir data/processed/FIN.PremierDraft \
-        --width 64 --epochs 1 --out-dir runs/attn_d64
+        --width 64 --epochs 3 --out-dir runs/attn_d64
+
+Three epochs, not one and not ten: see `grid.DEFAULT_EPOCHS` for the measured
+reason, and `docs/RESULTS.md` for the curve it was read off.
 
 `--data-fraction` is the grid's D axis. It subsamples **drafts**, not rows: a fraction drawn over rows would leave most drafts present with a few picks missing, which is a different and easier distribution than seeing fewer complete drafts.
 

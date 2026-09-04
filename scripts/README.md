@@ -1,6 +1,6 @@
 # Running a cell on a Colab accelerator
 
-CPU-only, at 25.6 GFLOP/s, the grid in `docs/PROJECT_PLAN.md` §4 is not a
+CPU-only, at 25.6 GFLOP/s, the grid in `docs/PROJECT_PLAN.md` §6 is not a
 workload that exists. These two scripts are how a cell runs on a T4 instead --
 and, by design though not yet in practice, on a TPU.
 
@@ -76,7 +76,7 @@ A second defect fell out of the first. `metrics.json` recorded `elapsed_s`
 measured from the last segment's start while the history beside it was
 cumulative. Throughput is examples over elapsed, so 47.1M examples over 893.6s
 would have read as 52,700 ex/s on a T4 that sustained 17,500: a per-step cost
-understated threefold, in the exact number section 4's grid is budgeted
+understated threefold, in the exact number section 6's grid is budgeted
 against. Both are fixed; the budget stays segment-local, the reporting does
 not.
 
@@ -127,6 +127,36 @@ the compute; the ceiling here is capacity, not steps.
 Attention is the cheaper arm at this width -- 19,709 ex/s against 17,479, some
 13% -- which is the opposite of what the fused-kernel work is meant to
 address, and worth remembering when reading a per-step cost off this table.
+
+Both checkpoints have since been run through `src/analysis/synergy.py` and the
+BDH one through `src/training/density.py` again at convergence. Those results
+live in `docs/RESULTS.md`; the short version is that the pool is worth +1.73
+nats to both arms and about half of that effect is genuine pairwise
+interaction rather than colour-matching.
+
+## Sizing a cell: --epochs, not --steps
+
+    scripts/colab_run.sh --gpu A100 --set FIN --arm bdh --width 256 \
+        --epochs 3 --data-fraction 0.25
+
+`--steps` is right for a one-off run at full data and wrong for a grid cell.
+`PROJECT_PLAN.md` section 6 requires the D axis to be data scale, and at fixed
+steps a small `--data-fraction` silently becomes many passes over little data
+-- so the fitted beta would be a repetition exponent wearing a data exponent's
+name. `--epochs` takes precedence over `--steps` inside `run.py`, and the
+driver's plan output says which one is live.
+
+Three is the number, from the ten-epoch curve above: the tenth epoch bought
+0.0010 and epochs four through ten together bought 0.0123. See
+`grid.DEFAULT_EPOCHS`.
+
+`--data-fraction` and `--neuron-multiplier` are first-class driver flags for
+the same reason. **All three participate in the default run name**, which is
+not cosmetic: the name is the artefact directory, and the artefact directory
+is where resume state lives. Two cells that differ only in epochs and share a
+name do not overwrite each other cleanly -- the second finds the first's
+resume state and *continues* it, producing a plausible number for an
+experiment nobody ran.
 
 ## Authenticate once
 
