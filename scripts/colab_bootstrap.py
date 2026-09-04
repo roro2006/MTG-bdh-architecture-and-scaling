@@ -556,8 +556,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="where the driver looks for results to download")
     parser.add_argument("--run-name", default=None,
                         help="artefact directory name. Defaults to a name built "
-                             "from arm/width/set/steps; pass it explicitly when "
-                             "using --epochs, since the default reads --steps.")
+                             "from arm/width/set and whichever of steps/epochs "
+                             "sized the run, plus any non-default fraction, "
+                             "neuron multiplier or seed.")
     parser.add_argument("--cache-dir", default=None,
                         help="optional processed-data cache, e.g. a mounted "
                              "/content/drive/MyDrive/mtg-cache. Off by default; "
@@ -610,12 +611,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def default_run_name(args: argparse.Namespace, set_code: str) -> str:
+    """A name that separates any two invocations that are different runs.
+
+    It used to key on --steps unconditionally, which was correct while
+    --steps was the only size knob. With --epochs it is not: run.py gives
+    --epochs precedence, so two grid cells at 1 and 3 epochs both carry the
+    default 3000 in their name, land in the same artefact directory, and the
+    second *resumes* the first's state rather than overwriting it cleanly --
+    a wrong number rather than a missing one. Sizing by epochs therefore
+    names by epochs, and the neuron multiplier joins the name whenever it
+    leaves its default, for the same reason.
+    """
     short = {"attention": "attn", "bdh": "bdh"}[args.arm]
-    name = f"{short}_d{args.width}_{set_code}_s{args.steps}"
+    size = f"e{args.epochs:g}" if args.epochs is not None else f"s{args.steps}"
+    name = f"{short}_d{args.width}_{set_code}_{size}"
     if args.fused_kernels:
         name += "_fused"
     if args.data_fraction < 1.0:
         name += f"_f{args.data_fraction:g}"
+    if args.neuron_multiplier != 4:
+        name += f"_n{args.neuron_multiplier}"
     if args.seed:
         name += f"_seed{args.seed}"
     return name

@@ -189,3 +189,69 @@ def test_resume_flag_reaches_run_py_only_when_asked():
     off = build(module["parse_args"](base + ["--no-resume"]), Path("/p"), Path("/o"))
     assert "--resume" in on
     assert "--resume" not in off
+
+
+def test_default_run_name_separates_cells_sized_by_epochs():
+    """The run name is the artefact directory, and that is where resume lives.
+
+    `--epochs` overrides `--steps` inside run.py, so two grid cells at 1 and 3
+    epochs both carry the default 3000 if the name reads `--steps`. They then
+    share an artefact directory, and the second does not overwrite the first --
+    it finds the first's resume state and *continues* it, reporting a
+    plausible number for an experiment nobody ran. That is a wrong result
+    rather than a missing one, which is why it is asserted here.
+    """
+    module = _load_bootstrap_without_running_it()
+    parse_args, default_run_name = module["parse_args"], module["default_run_name"]
+
+    def cell(*extra):
+        args = parse_args(["--sets", "FIN", "--train-set", "FIN", *extra])
+        return default_run_name(args, "FIN")
+
+    arm = ["--arm", "bdh"]
+
+    # Sized by steps: unchanged from before --epochs existed.
+    assert cell(*arm) == "bdh_d64_FIN_s3000"
+
+    # Sized by epochs: named by epochs, and two epoch counts differ.
+    assert cell(*arm, "--epochs", "3") == "bdh_d64_FIN_e3"
+    assert cell(*arm, "--epochs", "1") != cell(*arm, "--epochs", "3")
+
+    # The same epoch count at a different data fraction is a different cell,
+    # which is the whole D axis.
+    assert cell(*arm, "--epochs", "3", "--data-fraction", "0.25") != cell(
+        *arm, "--epochs", "3"
+    )
+
+    # And so is the same cell at a different neuron multiplier, now that
+    # PROJECT_PLAN section 4 has unpinned it.
+    assert cell(*arm, "--epochs", "3", "--neuron-multiplier", "8") != cell(
+        *arm, "--epochs", "3"
+    )
+    assert cell(*arm, "--neuron-multiplier", "4") == cell(*arm)
+
+
+def test_the_driver_forwards_the_grid_flags_and_names_by_them():
+    """--epochs is unusable for a grid if the driver cannot express it.
+
+    Section 6 requires the D axis to be data scale, which requires cells to
+    be sized in epochs. The driver had `--steps` only, so every grid cell had
+    to reach `--epochs` through the `--` passthrough while the run name went
+    on reading `--steps` -- the collision above, arriving by a different road.
+    """
+    source = DRIVER.read_text(encoding="utf-8")
+
+    for flag, var in (
+        ("--epochs", "EPOCHS"),
+        ("--data-fraction", "DATA_FRACTION"),
+        ("--neuron-multiplier", "NEURON_MULTIPLIER"),
+    ):
+        assert f"{flag})" in source, f"the driver does not accept {flag}"
+        assert f'bootstrap_argv+=({flag} "${var}")' in source.replace("  ", " "), (
+            f"the driver accepts {flag} but never forwards it, which is worse "
+            "than not accepting it: the cell would train at the default and "
+            "report the flag in its plan"
+        )
+
+    # The default name has to branch on how the cell was sized.
+    assert 'RUN_NAME="${ARM}_d${WIDTH}_e${EPOCHS}"' in source
