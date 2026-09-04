@@ -16,6 +16,7 @@ from src.analysis.synergy import (
     AblationResult,
     PickProbe,
     decoy_pools,
+    interaction_residual,
     pairwise_synergy,
     pool_ablation,
     pool_sensitivity,
@@ -384,6 +385,70 @@ def test_a_negative_cross_colour_mean_is_reported_as_negative():
     summary = synergy_summary(None, features, penalising, candidates, anchors)
     assert summary["mean_lift_cross_colour"] == pytest.approx(-2.0)
     assert summary["colour_gap"] == pytest.approx(3.0)
+
+
+def test_an_additive_lift_matrix_has_no_interaction():
+    """The control the colour split cannot provide.
+
+    This matrix is `row[c] + col[a]` exactly: every candidate has a fixed
+    appetite for pools and every anchor a fixed loudness, and nothing
+    depends on the pairing. That is precisely what a colour-matcher plus a
+    card-quality prior produces, and it can post a large
+    `within_colour_spread` while containing no interaction at all -- so if
+    the residual did not vanish here, a null result would read as a finding.
+    """
+    row = np.array([2.0, -1.0, 0.5])[:, None]
+    col = np.array([1.0, 3.0, -2.0, 0.0])[None, :]
+    additive = row + col
+
+    resid = interaction_residual(additive)
+    assert np.allclose(resid, 0.0, atol=1e-12)
+
+
+def test_a_pairing_effect_survives_the_main_effect_subtraction():
+    """The other half: a real interaction must not be subtracted away.
+
+    Same additive base, plus a single pair that the model likes more than
+    either card's main effect explains. The residual has to keep it, and
+    keep it at that pair rather than smearing it over the row and column.
+    """
+    row = np.array([2.0, -1.0, 0.5])[:, None]
+    col = np.array([1.0, 3.0, -2.0, 0.0])[None, :]
+    lift = row + col
+    lift[1, 2] += 6.0
+
+    resid = interaction_residual(lift)
+    assert np.unravel_index(np.argmax(resid), resid.shape) == (1, 2)
+
+    # A single spike is attenuated by exactly (1 - 1/rows)(1 - 1/cols), since
+    # the row and column means it inflates are subtracted back off. Asserting
+    # the algebra rather than a threshold: it pins the estimator, and it is
+    # the reason a residual is read for sign and ordering rather than as a
+    # number of nats.
+    rows, cols = lift.shape
+    assert resid[1, 2] == pytest.approx(6.0 * (1 - 1 / rows) * (1 - 1 / cols))
+
+
+def test_interaction_variance_share_separates_the_two_cases():
+    """The headline scalar, asserted at both ends of its range.
+
+    `within_colour_spread` cannot do this: it is large in both matrices
+    below, because a row effect spreads same-colour pairs just as
+    effectively as an interaction does.
+    """
+    features, candidates, anchors = _four_colour_features()
+
+    # Purely additive: candidate 0 likes every pool, candidate 1 likes none.
+    additive = np.array([[4.0, 4.0], [0.0, 0.0]])
+    assert synergy_summary(
+        None, features, additive, candidates, anchors
+    )["interaction_variance_share"] == pytest.approx(0.0, abs=1e-9)
+
+    # Pure interaction: the same marginals, but which pair matters.
+    interacting = np.array([[4.0, 0.0], [0.0, 4.0]])
+    assert synergy_summary(
+        None, features, interacting, candidates, anchors
+    )["interaction_variance_share"] == pytest.approx(1.0)
 
 
 def test_strongest_pairs_reports_names_in_descending_order(corpus):

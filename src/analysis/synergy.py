@@ -459,6 +459,36 @@ def pairwise_synergy(
     return log_probs[1:].T - log_probs[0][:, None]
 
 
+def interaction_residual(lift: np.ndarray) -> np.ndarray:
+    """`lift` with its additive main effects removed.
+
+    A lift matrix is not yet evidence of interaction. Two things inflate it
+    that have nothing to do with a candidate and an anchor *pairing*: a
+    candidate that gains from any non-empty pool whatsoever (a row effect,
+    which is mostly "this card is good and the empty-pool baseline
+    underrates it"), and an anchor that is a loud colour beacon whichever
+    candidate it is shown against (a column effect). Both are one-card
+    properties. A model that had learned nothing but one-card properties
+    would still post a large `within_colour_spread`, because that statistic
+    cannot tell a row effect from an interaction.
+
+    Subtracting the row mean, the column mean and the grand mean leaves the
+    part of the lift that depends on *which* candidate meets *which*
+    anchor. That residual is the interaction term the arm exists to
+    compute, and it is the only part of this matrix that PROJECT_PLAN.md
+    section 4's claim -- "synergy lives in the interaction arm" -- predicts
+    at all. Read `interaction_variance_share` in `synergy_summary` for how
+    much of the raw lift survives the subtraction: a perfectly additive
+    matrix scores 0 and has no pairwise content, however large its entries.
+    """
+    return (
+        lift
+        - lift.mean(axis=1, keepdims=True)
+        - lift.mean(axis=0, keepdims=True)
+        + lift.mean()
+    )
+
+
 def synergy_summary(
     probe: PickProbe,
     features: CardFeatures,
@@ -510,6 +540,18 @@ def synergy_summary(
     #     pure colour matcher treats every same-colour anchor alike and has
     #     a spread near zero, so a large spread here is the part of the pool
     #     effect that colour cannot account for.
+    #
+    # `within_colour_spread` is necessary but not sufficient, and the two
+    # `interaction_*` numbers are what close the gap. See
+    # `interaction_residual`: a candidate that gains from *any* pool and an
+    # anchor that shouts its colour at *every* candidate are both one-card
+    # effects, and both inflate the spread without any pairing having been
+    # learned. `interaction_variance_share` is the fraction of the lift's
+    # variance that survives removing them -- the part that is genuinely
+    # about this candidate meeting this anchor.
+    resid = interaction_residual(lift)
+    total_var = float(lift.var())
+
     return {
         "pairs": int(lift.size),
         "same_colour_pairs": int(same.size),
@@ -522,6 +564,14 @@ def synergy_summary(
         ),
         "within_colour_spread": _std(same),
         "cross_colour_spread": _std(different),
+        # The interaction term, which is the part colour and card quality
+        # together cannot account for.
+        "interaction_spread": _std(resid),
+        "interaction_variance_share": (
+            float(resid.var() / total_var) if total_var > 0 else float("nan")
+        ),
+        "interaction_spread_same_colour": _std(resid[shares & colored]),
+        "interaction_spread_cross_colour": _std(resid[(~shares) & colored]),
     }
 
 
@@ -550,6 +600,20 @@ def strongest_pairs(
 # --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
+
+def _draftable_ids(data: PickData) -> np.ndarray:
+    """Card ids that actually turn up in a pack.
+
+    The vocabulary is wider than the draftable set -- basic lands above all
+    -- and an anchor drawn uniformly from it can be a card no drafter ever
+    chose. A pool of six Swamps is pure colour signal and no card, so it
+    answers the colour question loudly and the synergy question not at all,
+    which is the one confound this probe is built to avoid. Sampling from
+    what packs contain keeps both axes of the matrix on the distribution
+    the model was trained on.
+    """
+    return np.unique(data.pack[data.pack >= 0]).astype(np.int64)
+
 
 def _pick_example_pack(data: PickData, seed: int, min_size: int = 6) -> int:
     """A mid-pack row with enough options left for a ranking to be visible."""
@@ -619,18 +683,40 @@ def main(argv: list[str] | None = None) -> int:
     }
 
     # -- 3. pairwise synergy ----------------------------------------------
-    n_cand = min(args.candidates, probe.geometry.max_pack_size)
-    candidates = rng.choice(data.vocab.size, size=n_cand, replace=False).tolist()
-    anchors = rng.choice(data.vocab.size, size=args.anchors, replace=False).tolist()
+    draftable = _draftable_ids(data)
+    n_cand = min(args.candidates, probe.geometry.max_pack_size, draftable.size)
+    n_anchor = min(args.anchors, draftable.size)
+    candidates = rng.choice(draftable, size=n_cand, replace=False).tolist()
+    anchors = rng.choice(draftable, size=n_anchor, replace=False).tolist()
     lift = pairwise_synergy(probe, candidates, anchors)
     summary = synergy_summary(probe, features, lift, candidates, anchors)
     print("pairwise synergy (log-probability lift from a pool of one card)")
+    print(f"  drawn from {draftable.size:,} cards seen in a pack, "
+          f"of {data.vocab.size:,} in the vocabulary")
     for key, value in summary.items():
-        print(f"  {key:26s} {value}")
-    print("  strongest pairs:")
-    for cand, anchor, value in strongest_pairs(probe, lift, candidates, anchors):
-        print(f"    {value:+.3f}  {cand[:34]:<34} <- pool of {anchor[:30]}")
+        print(f"  {key:32s} {value}")
+
+    # Raw lift first, then the same ranking with the additive main effects
+    # removed. The two lists disagreeing is the point: a pair that only
+    # tops the raw list is a good card meeting a loud anchor, and a pair
+    # that survives into the residual list is the model asserting that
+    # these two in particular belong together.
+    print("  strongest raw lifts:")
+    for cand, anchor_name, value in strongest_pairs(probe, lift, candidates, anchors):
+        print(f"    {value:+.3f}  {cand[:34]:<34} <- pool of {anchor_name[:30]}")
+    resid = interaction_residual(lift)
+    print("  strongest interactions (main effects removed):")
+    interactions = strongest_pairs(probe, resid, candidates, anchors)
+    for cand, anchor_name, value in interactions:
+        print(f"    {value:+.3f}  {cand[:34]:<34} <- pool of {anchor_name[:30]}")
+
     report["pairwise"] = summary
+    report["pairwise"]["draftable_cards"] = int(draftable.size)
+    report["pairwise"]["vocab_size"] = int(data.vocab.size)
+    report["strongest_raw_lifts"] = strongest_pairs(
+        probe, lift, candidates, anchors
+    )
+    report["strongest_interactions"] = interactions
     print("=" * 70)
 
     if args.json_out:
