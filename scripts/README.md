@@ -71,9 +71,62 @@ ten hours and asserts the next segment still runs to completion. The existing
 resume tests could not have caught this: they all use `max_seconds=0.0`, which
 fires whichever clock it reads.
 
+A second defect fell out of the first. `metrics.json` recorded `elapsed_s`
+893.6 for a run whose own history ends at 2,695s -- the returned figure was
+measured from the last segment's start while the history beside it was
+cumulative. Throughput is examples over elapsed, so 47.1M examples over 893.6s
+would have read as 52,700 ex/s on a T4 that sustained 17,500: a per-step cost
+understated threefold, in the exact number section 4's grid is budgeted
+against. Both are fixed; the budget stays segment-local, the reporting does
+not.
+
 One limitation this turned up and did not fix: `--mirror-resume` copies the
 resume state *off* the VM, but nothing copies it back. It is a hedge that
 currently buys an artefact, not an automated recovery.
+
+## The first properly-trained cells
+
+Both arms, `--width 64 --steps 92000` on FIN at commit `a53e5a27` -- 92,000
+steps at batch 512 is 47.1M examples, ten passes over the 4,711,938 training
+rows. Two T4 sessions, two segments each, both `completed`.
+
+| | BDH | attention | 3,000-step BDH reference |
+|---|---|---|---|
+| all-picks loss | 0.8214 | **0.8212** | 0.8814 |
+| all-picks accuracy | **0.6841** | 0.6834 | 0.6638 |
+| picks 0-8 loss | 1.0037 | **1.0033** | 1.0806 |
+| picks 0-8 accuracy | **0.6248** | 0.6239 | 0.5997 |
+| best val loss | 0.8222 | **0.8211** | 0.8846 |
+| best step | 88,250 | 88,250 | 2,750 |
+| parameters | 261,633 | 263,745 | 261,633 |
+| training wall clock | 2,695s | 2,390s | 100s |
+| throughput | 17,479 ex/s | 19,709 ex/s | 15,291 ex/s |
+| driver invocation | 51m50s | 47m52s | 8m16s |
+
+Baselines on the same val split, identical for both: uniform 1.7994, pick-rate
+prior 1.5662 (acc 0.4526). 42,072 of the 589,008 val rows (7.1%) are forced
+picks with loss identically 0.
+
+**The two arms are a dead heat.** 0.0002 on all-picks and 0.0004 on picks 0-8,
+at 0.8% different parameter counts, is far inside what a seed change moves.
+Nothing here separates the architectures on this task at this width; one seed
+per arm cannot, and was not meant to. What it does establish is that the
+earlier 3,000-step gap was a measure of who converged faster, not of where
+either arm lands.
+
+Ten epochs is past the point of return but not obviously wrong. Best val per
+10k-step window flattens hard -- BDH gains 0.0166 in the second window and
+0.0010 in the ninth -- and over the last 20,000 steps val moves inside a
+0.0040 band for BDH and 0.0043 for attention, which is noise at this scale.
+Both arms peak at step 88,250 of 92,000 and both end slightly above their own
+best, so the curve is flat rather than still descending. Train loss sits well
+below val by then (BDH 0.78 against 0.82), so the remaining passes are buying
+memorisation. Three or four epochs would land in the same place for a third of
+the compute; the ceiling here is capacity, not steps.
+
+Attention is the cheaper arm at this width -- 19,709 ex/s against 17,479, some
+13% -- which is the opposite of what the fused-kernel work is meant to
+address, and worth remembering when reading a per-step cost off this table.
 
 ## Authenticate once
 
