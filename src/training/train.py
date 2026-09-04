@@ -298,6 +298,15 @@ def train_model(
     def _elapsed() -> float:
         return elapsed_offset + (time.monotonic() - started)
 
+    # `max_seconds` is the budget for THIS segment, so it is measured from
+    # this process's start and must not carry the offset. Charging a segment
+    # for time earlier segments already spent turns the budget into a
+    # whole-run cap: once the cumulative total passes it, every later segment
+    # stops at its first evaluation boundary, advancing one eval interval per
+    # Colab round trip and exhausting --max-segments far short of the run.
+    def _segment_elapsed() -> float:
+        return time.monotonic() - started
+
     def _write_resume(step: int) -> None:
         if checkpoint_dir is None:
             return
@@ -369,14 +378,15 @@ def train_model(
             if (
                 max_seconds is not None
                 and step < train_config.total_steps
-                and _elapsed() >= max_seconds
+                and _segment_elapsed() >= max_seconds
             ):
                 completed = False
                 if verbose:
                     print(
-                        f"  segment budget reached ({_elapsed():,.0f}s >= "
+                        f"  segment budget reached ({_segment_elapsed():,.0f}s >= "
                         f"{max_seconds:,.0f}s) at step {step:,} of "
-                        f"{train_config.total_steps:,}; state saved, resumable",
+                        f"{train_config.total_steps:,}, {_elapsed():,.0f}s total; "
+                        f"state saved, resumable",
                         flush=True,
                     )
                 break

@@ -316,3 +316,57 @@ def test_finished_run_leaves_no_resume_state(tmp_path, ingested):
 
     assert not (out / RESUME_PARAMS_FILE).exists()
     assert not (out / RESUME_STATE_FILE).exists()
+
+
+def test_segment_budget_is_per_segment_not_cumulative(tmp_path, ingested, feature_table):
+    """A resumed segment gets the full budget again, not what is left of it.
+
+    `elapsed_s` in the history is deliberately cumulative so the curve stays
+    monotonic across an interruption. Charging the budget against that same
+    figure is what turns `max_seconds` into a whole-run cap: once the total
+    passes it, every later segment stops at its first evaluation boundary and
+    a long cell advances one eval interval per Colab round trip, exhausting
+    `--max-segments` far short of the run.
+
+    The other resume tests all use `max_seconds=0.0`, which fires whichever
+    clock it reads, so none of them can tell the two apart. This one forces
+    the accumulated offset to dwarf the budget and asserts the segment runs
+    to completion anyway.
+    """
+    from src.training.train import train_model
+
+    data, splits, config = _train_inputs(ingested, feature_table)
+    table = jnp.asarray(np.zeros((data.vocab.size, FEATURE_DIM), dtype=np.float32))
+    train_config = _tiny_train_config()
+    out = tmp_path / "budgeted"
+
+    first = train_model(
+        data, table, splits.train, splits.val, config, train_config,
+        arm="attention", verbose=False, checkpoint_dir=out, max_seconds=0.0,
+    )
+    assert first["completed"] is False
+    assert first["stopped_at_step"] < train_config.total_steps
+
+    # Backdate the run: pretend earlier segments already burned ten hours.
+    # Nothing else about the state changes, so a correct resume is unaffected.
+    state_path = out / "resume.json"
+    state = json.loads(state_path.read_text())
+    state["history"][-1]["elapsed_s"] = 36_000.0
+    state_path.write_text(json.dumps(state))
+
+    # A budget far below the accumulated offset, but far above anything this
+    # 20-step run can spend. Cumulative accounting stops at the next boundary;
+    # per-segment accounting finishes the run.
+    resumed = train_model(
+        data, table, splits.train, splits.val, config, train_config,
+        arm="attention", verbose=False, checkpoint_dir=out,
+        resume=True, max_seconds=600.0,
+    )
+
+    assert resumed["completed"] is True, (
+        "the segment stopped early despite a 600s budget it could not have "
+        "spent; the budget is being charged the previous segments' time"
+    )
+    assert resumed["stopped_at_step"] == train_config.total_steps
+    # The history stays cumulative -- the fix must not reset that too.
+    assert resumed["history"][-1]["elapsed_s"] > 36_000.0

@@ -40,11 +40,40 @@ dependencies, staging from the 17lands export, training, `STATUS.json`,
 artefact download into `runs/<name>/`, session-log export, and teardown from the
 trap.
 
-Still unexercised, and so still only designed: the multi-segment resume path
-(this cell finished inside one 30-minute segment, so `--resume` was passed but
-never had state to restore), `--cache-dir`, TPU runtimes, and `--fused-kernels`.
-Re-running the kernel tests with `KERNEL_INTERPRET=0` is also still pending --
-the bootstrap has no pytest path, and one was deliberately not improvised.
+Still unexercised, and so still only designed: `--cache-dir`, TPU runtimes, and
+`--fused-kernels`. Re-running the kernel tests with `KERNEL_INTERPRET=0` is also
+still pending -- the bootstrap has no pytest path, and one was deliberately not
+improvised.
+
+### The multi-segment path, and the bug it was hiding
+
+The first cell long enough to cross a segment boundary was run on 2026-09-03:
+`--arm bdh --width 64 --steps 92000`, ten passes over FIN. Segment 1 trained to
+step 60,750 in 1,806s, saved state, and exited 75; segment 2 restarted with
+`resuming at step 60,750 of 92,000 (best val 0.8246 at step 60,250)`. So the
+part that was only designed -- state off the VM, step counter and best-val
+tracker carried across a Colab round trip -- does work.
+
+What it exposed is that the budget was being charged the *wrong clock*.
+`elapsed_s` is cumulative by design, so the history stays monotonic across an
+interruption; the budget check in `src/training/train.py` read that same
+figure. Once the cumulative total passed `--max-seconds`, every later segment
+tripped the budget at its first evaluation boundary: segments 2 and 3 advanced
+250 steps each, reporting 1,831s and 1,856s against an 1,800s budget. A run
+long enough to need segments therefore could not finish -- it would burn all 24
+segments to cover ~6,000 of the 31,250 steps remaining, one eval interval per
+round trip, while the driver's same-step guard stayed quiet because the step
+counter *was* advancing.
+
+The budget now measures segment-local time. `tests/test_checkpoint.py::
+test_segment_budget_is_per_segment_not_cumulative` backdates a resume state by
+ten hours and asserts the next segment still runs to completion. The existing
+resume tests could not have caught this: they all use `max_seconds=0.0`, which
+fires whichever clock it reads.
+
+One limitation this turned up and did not fix: `--mirror-resume` copies the
+resume state *off* the VM, but nothing copies it back. It is a hedge that
+currently buys an artefact, not an automated recovery.
 
 ## Authenticate once
 
