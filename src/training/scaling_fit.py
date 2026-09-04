@@ -3,9 +3,10 @@ the Chinchilla paper's robust-fit approach (Huber loss on log-residuals,
 not naive least squares) so the small-N, high-loss corner of the grid
 doesn't dominate the fit. See docs/PROJECT_PLAN.md section 5.
 
-Both an iso-parameter and an iso-FLOP fit are produced for each
-architecture -- see docs/ARCHITECTURE.md's fairness note on why these are
-genuinely different comparisons here.
+An iso-parameter and an iso-FLOP fit are both available for each
+architecture -- one call per axis, `fit_by_architecture` for both arms at
+once -- see docs/ARCHITECTURE.md's fairness note on why these are genuinely
+different comparisons here.
 
 Three things about this fit are not free choices, and each of them is a way
 it could otherwise report a confident wrong number.
@@ -74,8 +75,11 @@ EXPONENT_BOUNDS = (0.0, 3.0)
 # basin it was dropped in.
 EXPONENT_SEEDS = (0.02, 0.05, 0.1, 0.2, 0.35, 0.5, 0.75, 1.0)
 
-# Starting points kept from that grid and refined. Eight is well past the
-# point where the best refined solution stops changing on a grid this size.
+# Starting points kept from that grid and refined. It matters that this is
+# more than one: on the planted law in tests/test_scaling_fit.py a single
+# start converges to beta = 0.349 against a true 0.31, and every count from
+# two upward finds 0.296. Eight is margin over that, and the whole fit runs
+# once against thirteen GPU-hours of results.
 DEFAULT_STARTS = 8
 
 LOSS_KEYS = ("decision_picks", "all_picks", "best_val_loss", "final_val_loss")
@@ -393,7 +397,7 @@ def _solve(
             # Default ftol stops when the objective moves less than ~2e-9,
             # which on a mean Huber of order 1e-6 is a 0.1% relative change
             # -- i.e. before the exponents have moved off their seed.
-            options={"ftol": 1e-16, "gtol": 1e-12, "maxiter": 2000},
+            options={"ftol": 1e-13, "gtol": 1e-10, "maxiter": 500},
         )
         if result.fun < best_value:
             best_theta, best_value = result.x, float(result.fun)
@@ -439,13 +443,11 @@ def _bootstrap_intervals(
         return {"alpha": nan, "beta": nan, "E": nan}, 0
 
     rng = np.random.default_rng(seed)
-    # Warm-started from the full-data solution plus two grid seeds: a
-    # resample is a small perturbation of the data it came from, so the
-    # basin is almost always the same one, and paying for a full multi-start
-    # per draw would make the interval cost more than the fit.
-    log_cost, log_data = np.log(cost), np.log(data)
-    evaluate = _make_objective(log_cost, log_data, loss, objective, delta)
-    warm = [theta] + _seed_starts(log_cost, log_data, loss, evaluate, 2)
+    # Warm-started from the full-data solution rather than re-run from the
+    # seed grid: a resample is a small perturbation of the data it came
+    # from, so the basin is almost always the same one, and a full
+    # multi-start per draw makes the interval cost several times the fit.
+    warm = [theta]
 
     draws: list[np.ndarray] = []
     for _ in range(samples):

@@ -9,13 +9,21 @@ The single-cell runner, the pilot grid, and the curve fit for $L(N, D) = E + A/N
 | `checkpoint.py` | save/restore params + metadata | done |
 | `run.py` | CLI entry point for a single cell | done |
 | `grid.py` | the sweep | designed and tested, not yet run |
-| `scaling_fit.py` | the curve fit | not started |
+| `scaling_fit.py` | the curve fit | done, tested on planted laws |
 
 ## The fit is a sizing procedure
 
 $L(N, D)$ is not fit here to make a claim about scaling exponents. It is fit so that, given the compute budget available for the final run, the compute-optimal $(N^*, D^*)$ tells us how wide the drafter should be and how much data it should see — and so the arm with the better curve at that budget is the one that ships. See `docs/PROJECT_PLAN.md` §6.
 
 It follows Chinchilla's robust procedure: Huber loss on log-residuals rather than least squares on raw loss, since raw least squares over-weights the small-$N$, high-loss corner, with bootstrapped confidence intervals rather than bare point estimates.
+
+Three things about it are worth knowing before reading a number out of it.
+
+**It fits the exact picks-0-8 loss**, which `grid.run_cell` records under `summary` using the same `summarise_by_pick` that `run.py` writes. `best_val_loss` is a *sampled* all-picks number and is not the same quantity; a result file without the summary raises rather than falling back to it.
+
+**Interior cells are held out**, and their residuals are reported alongside the fit. A systematic offset there means the separable form is wrong — which is the only thing in the design that can detect it, since the L-shape's two arms each fold an interaction term into their own coefficient.
+
+**`compute_axis="flops"` puts per-example dense FLOPs on the cost axis, not total training FLOPs.** Total FLOPs travels with every point and is the budget the arms' curves are compared at (`compare_at`), but it cannot also be the axis: along the D arm `flops_per_example` is constant, so total FLOPs is proportional to $D$ there and the two power laws collapse into one variable.
 
 ## Running one cell
 
