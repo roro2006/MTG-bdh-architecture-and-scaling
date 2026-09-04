@@ -136,8 +136,14 @@ interaction rather than colour-matching.
 
 ## Sizing a cell: --epochs, not --steps
 
-    scripts/colab_run.sh --gpu A100 --set FIN --arm bdh --width 256 \
+    scripts/colab_run.sh --gpu T4 --set FIN --arm bdh --width 256 \
         --epochs 3 --data-fraction 0.25
+
+`--gpu T4` because **A100 does not allocate on a free account** -- the same
+fact the validation above exists to protect against, arriving as a
+deliberate choice rather than a typo. A100 needs Pro+ or pay-as-you-go
+compute units. Everything here runs on a T4; the A100 only changes how long
+the full grid takes, not whether a cell works.
 
 `--steps` is right for a one-off run at full data and wrong for a grid cell.
 `PROJECT_PLAN.md` section 6 requires the D axis to be data scale, and at fixed

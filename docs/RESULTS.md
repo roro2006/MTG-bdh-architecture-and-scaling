@@ -341,7 +341,7 @@ scripts/colab_run.sh --gpu T4 --set FIN --arm attention --width 64 --steps 92000
 A grid cell is sized in epochs instead, which the driver now takes directly:
 
 ```
-scripts/colab_run.sh --gpu A100 --set FIN --arm bdh --width 256 \
+scripts/colab_run.sh --gpu T4 --set FIN --arm bdh --width 256 \
     --epochs 3 --data-fraction 0.25
 ```
 

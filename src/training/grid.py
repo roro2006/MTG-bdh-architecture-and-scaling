@@ -48,8 +48,15 @@ measured T4 throughput the grid is 40 hours and its largest single cell is
 d=64 cell reaching 12% of the device's fp32 peak, and the wide rungs
 utilise it far better, which puts the realistic T4 total nearer 13 hours.
 On an A100 the same grid is about 3 hours and section 6's sentence is true
-again. The driver takes `--gpu A100` (the check is
-case-sensitive); that is the intended way to run this.
+again -- but an A100 does not allocate on a free Colab account, so that
+option costs money rather than patience. On the free tier the grid is a T4
+job measured in sessions, which the segment loop survives and a single
+sitting does not.
+
+What *is* comfortable on a free T4 is everything below the top rung.
+`neuron_probe` is three cells at 13, 17 and 25 minutes, each inside one
+default 30-minute segment, so the question section 4 reopened can be
+answered before any of this is committed to.
 """
 
 from __future__ import annotations
