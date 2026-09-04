@@ -20,6 +20,7 @@ TPU box should run the same file with `interpret=False`, which is what
 from __future__ import annotations
 
 import os
+from dataclasses import replace
 
 import jax
 import jax.numpy as jnp
@@ -38,6 +39,13 @@ from src.models.kernels.cross_attention import (
     fused_attention,
     reference_attention,
 )
+from src.models.kernels.set_encoder import (
+    FusedSetAttentionBlock,
+    fused_set_attention,
+    reference_set_attention,
+)
+from src.models.pick_model import ModelConfig, PickModel
+from src.models.set_encoder import SetAttentionBlock, SetEncoder
 
 # float32 matmuls reassociated by a different schedule; ~1e-6 relative is
 # the expected disagreement, and anything larger is a real bug.
@@ -171,6 +179,249 @@ class TestFusedAttention:
         comparable = (pack_mask & pool_mask.any(axis=-1)[:, None])[..., None]
         a, b = ref.apply(params, *args), fused.apply(params, *args)
         assert close(jnp.where(comparable, a, 0.0), jnp.where(comparable, b, 0.0))
+
+
+# --------------------------------------------------------------------------
+# Set-encoder kernel
+#
+# The set encoders are 63-74% of forward FLOPs (docs/PROJECT_PLAN.md section
+# 5), so this kernel is on the majority of the arithmetic in every run. It
+# is also on both arms' inputs, which means a wrong one would corrupt the
+# BDH side and the control side identically -- a bias no A/B comparison
+# could detect.
+# --------------------------------------------------------------------------
+
+class TestFusedSetAttention:
+    @pytest.fixture(params=["pack", "pool"])
+    def qkv_valid(self, request, masks):
+        """Both sets, because they exercise different things.
+
+        The pack is 14 long, padded to 16, and is never empty. The pool is
+        41, padded to 64 -- a 56% pad, the worst case in the model -- and is
+        empty at pick zero, which is the row that makes the softmax
+        denominator a question.
+        """
+        pack_mask, pool_mask = masks
+        length, valid = (
+            (PACK, pack_mask) if request.param == "pack" else (POOL, pool_mask)
+        )
+        keys = jax.random.split(jax.random.key(20), 3)
+        shape = (BATCH, HEADS, length, D // HEADS)
+        return (
+            tuple(jax.random.normal(keys[i], shape) for i in range(3)),
+            valid,
+        )
+
+    def test_forward_matches_reference(self, qkv_valid):
+        (q, k, v), valid = qkv_valid
+        assert close(
+            reference_set_attention(q, k, v, valid),
+            fused_set_attention(q, k, v, valid, **KERNEL_KW),
+        )
+
+    def test_gradients_match_reference(self, qkv_valid):
+        (q, k, v), valid = qkv_valid
+        weight = jax.random.normal(jax.random.key(21), q.shape)
+        ref = lambda *a: (reference_set_attention(*a, valid) * weight).sum()
+        fused = lambda *a: (fused_set_attention(*a, valid, **KERNEL_KW) * weight).sum()
+
+        for expected, actual in zip(
+            grad_of(ref, (0, 1, 2))(q, k, v), grad_of(fused, (0, 1, 2))(q, k, v)
+        ):
+            assert close(expected, actual)
+
+    def test_padded_rows_are_zero(self, qkv_valid):
+        """A PAD_ID slot attends to nothing and is defined as zero.
+
+        The mask is symmetric here, so this covers the empty pool at pick
+        zero as the same case rather than a special one.
+        """
+        (q, k, v), valid = qkv_valid
+        out = fused_set_attention(q, k, v, valid, **KERNEL_KW)
+        padded = jnp.broadcast_to(~valid[:, None, :], out.shape[:3])
+        assert jnp.all(out[padded] == 0.0)
+        assert jnp.isfinite(out).all()
+
+    def test_padding_cannot_reach_a_real_row(self, qkv_valid):
+        """Changing a padded card must change no real card's output.
+
+        This is the failure the ragged masking exists to prevent, and it is
+        the one that would be invisible: the shapes stay right, the loss
+        stays plausible, and the model quietly conditions on whatever
+        garbage sits in the padding region of the batch.
+        """
+        (q, k, v), valid = qkv_valid
+        pad = ~valid[:, None, :, None]
+        noise = jax.random.normal(jax.random.key(22), q.shape) * 10.0
+        perturb = lambda t: jnp.where(pad, t + noise, t)
+
+        base = fused_set_attention(q, k, v, valid, **KERNEL_KW)
+        moved = fused_set_attention(
+            perturb(q), perturb(k), perturb(v), valid, **KERNEL_KW
+        )
+        real = valid[:, None, :, None]
+        assert close(jnp.where(real, base, 0.0), jnp.where(real, moved, 0.0))
+
+    def test_padded_slots_receive_no_gradient(self, qkv_valid):
+        """The backward half of the same guarantee.
+
+        A padded slot that collected a gradient would train the shared
+        per-card projections on the padding value, which is a leak that
+        only shows up as slightly wrong weights.
+        """
+        (q, k, v), valid = qkv_valid
+        weight = jax.random.normal(jax.random.key(23), q.shape)
+        loss = lambda *a: (fused_set_attention(*a, valid, **KERNEL_KW) * weight).sum()
+        pad = ~valid[:, None, :, None]
+
+        for grad in grad_of(loss, (0, 1, 2))(q, k, v):
+            assert jnp.all(jnp.where(pad, grad, 0.0) == 0.0)
+
+    def test_block_matches_reference_block(self, masks):
+        """One parameter set, two execution paths.
+
+        Compared on real rows only: padded rows are where the two paths
+        deliberately disagree (EMPTY_ROW_NOTE), and `SetEncoder` zeroes them
+        before anything downstream can see them.
+        """
+        pack_mask, _ = masks
+        keys = jax.random.split(jax.random.key(24), 2)
+        x = jax.random.normal(keys[0], (BATCH, PACK, D))
+
+        ref = SetAttentionBlock(hidden_dim=D, num_heads=HEADS)
+        fused = FusedSetAttentionBlock(hidden_dim=D, num_heads=HEADS, **KERNEL_KW)
+
+        params = ref.init(keys[1], x, pack_mask)
+        assert param_paths(params["params"]) == param_paths(
+            fused.init(keys[1], x, pack_mask)["params"]
+        )
+
+        keep = lambda t: jnp.where(pack_mask[..., None], t, 0.0)
+        assert close(
+            keep(ref.apply(params, x, pack_mask)),
+            keep(fused.apply(params, x, pack_mask)),
+        )
+
+
+@pytest.mark.parametrize("length,lengths", [(PACK, PACK_LENGTHS), (POOL, POOL_LENGTHS)])
+def test_fused_set_encoder_matches_reference_exactly(length, lengths):
+    """Whole encoder, no rows excluded.
+
+    The block-level test has to compare on real rows only. This one does
+    not, and that is the point: `SetEncoder` multiplies by the mask before
+    returning, so the deliberate divergence on padded rows is erased and
+    exact agreement is the right bar. If the two paths ever differ *here*,
+    something reached a real card.
+    """
+    mask = jnp.arange(length)[None, :] < lengths[:, None]
+    x = jax.random.normal(jax.random.key(25), (BATCH, length, D))
+    build = lambda **extra: SetEncoder(
+        hidden_dim=D, num_heads=HEADS, num_layers=2, **extra
+    )
+    ref, fused = build(), build(fused=True)
+
+    params = ref.init(jax.random.key(26), x, mask)
+    assert param_paths(params["params"]) == param_paths(
+        fused.init(jax.random.key(26), x, mask)["params"]
+    )
+
+    for expected, actual in zip(
+        ref.apply(params, x, mask), fused.apply(params, x, mask)
+    ):
+        assert close(expected, actual)
+
+    weight = jax.random.normal(jax.random.key(27), (BATCH, length, D))
+    loss = lambda module, p: (module.apply(p, x, mask)[0] * weight).sum()
+    flatten = lambda g: jnp.concatenate(
+        [leaf.ravel() for leaf in jax.tree_util.tree_leaves(g)]
+    )
+    assert close(
+        flatten(jax.grad(loss, argnums=1)(ref, params)),
+        flatten(jax.grad(loss, argnums=1)(fused, params)),
+    )
+
+
+def test_fused_set_encoder_is_permutation_equivariant():
+    """Reordering the set permutes the outputs and changes nothing else.
+
+    docs/PROJECT_PLAN.md section 4 makes order *structurally* unusable, not
+    merely ignored. A kernel is the easiest place to break that by accident
+    -- a block index leaking into the arithmetic would be a positional
+    encoding nobody chose. This is the assertion that keeps it closed.
+    """
+    mask = jnp.arange(POOL)[None, :] < POOL_LENGTHS[:, None]
+    x = jax.random.normal(jax.random.key(28), (BATCH, POOL, D))
+    encoder = SetEncoder(hidden_dim=D, num_heads=HEADS, num_layers=2, fused=True)
+    params = encoder.init(jax.random.key(29), x, mask)
+
+    order = jax.random.permutation(jax.random.key(30), POOL)
+    per_card, pooled = encoder.apply(params, x, mask)
+    shuffled_cards, shuffled_pooled = encoder.apply(
+        params, x[:, order], mask[:, order]
+    )
+    assert close(per_card[:, order], shuffled_cards)
+    assert close(pooled, shuffled_pooled)
+
+
+def test_fused_set_encoder_works_under_jit():
+    """Training runs jitted, so eager agreement is not enough on its own.
+
+    Asserting `pallas_call` actually reaches the jaxpr matters as much as
+    the values: a silent fallback to the reference block would make every
+    other test in this section pass for the wrong reason.
+    """
+    mask = jnp.arange(POOL)[None, :] < POOL_LENGTHS[:, None]
+    x = jax.random.normal(jax.random.key(31), (BATCH, POOL, D))
+    build = lambda **extra: SetEncoder(
+        hidden_dim=D, num_heads=HEADS, num_layers=2, **extra
+    )
+    ref, fused = build(), build(fused=True)
+    params = ref.init(jax.random.key(32), x, mask)
+
+    assert "pallas_call" in str(
+        jax.make_jaxpr(lambda p: fused.apply(p, x, mask)[0])(params)
+    )
+    forward = jax.jit(lambda module, p: module.apply(p, x, mask)[0], static_argnums=0)
+    assert close(forward(ref, params), forward(fused, params))
+
+    weight = jax.random.normal(jax.random.key(33), (BATCH, POOL, D))
+    backward = jax.jit(
+        jax.grad(lambda p, module: (module.apply(p, x, mask)[0] * weight).sum()),
+        static_argnums=1,
+    )
+    flatten = lambda g: jnp.concatenate(
+        [leaf.ravel() for leaf in jax.tree_util.tree_leaves(g)]
+    )
+    assert close(
+        flatten(backward(params, ref)), flatten(backward(params, fused))
+    )
+
+
+def test_fused_kernels_flag_routes_the_encoders_too():
+    """`ModelConfig(fused_kernels=True)` is one switch for the whole model.
+
+    Before this kernel the flag only reached the arm, which is 26-37% of
+    forward FLOPs. A flag that silently left the majority of the model on
+    flax would make any wall-clock claim about "the fused model" false.
+    """
+    feature_table = jax.random.normal(jax.random.key(34), (30, 65))
+    pack_ids = jnp.array([[0, 1, 2, 3], [4, 5, -1, -1], [6, -1, -1, -1]])
+    pool_ids = jnp.array([[7, 8, -1], [9, -1, -1], [-1, -1, -1]])
+    scalar = jnp.zeros((3,), dtype=jnp.int32)
+    args = (feature_table, pack_ids, pool_ids, scalar, scalar)
+
+    base = ModelConfig(hidden_dim=D, num_heads=HEADS, card_feature_dim=65)
+    reference = PickModel(config=base, arm="attention")
+    fused = PickModel(config=replace(base, fused_kernels=True), arm="attention")
+
+    params = reference.init(jax.random.key(35), *args)
+    assert param_paths(params["params"]) == param_paths(
+        fused.init(jax.random.key(35), *args)["params"]
+    )
+    assert "pallas_call" in str(
+        jax.make_jaxpr(lambda p: fused.apply(p, *args))(params)
+    )
+    assert close(reference.apply(params, *args), fused.apply(params, *args))
 
 
 # --------------------------------------------------------------------------

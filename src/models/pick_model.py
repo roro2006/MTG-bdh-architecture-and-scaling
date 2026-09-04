@@ -51,9 +51,9 @@ class ModelConfig:
     # 12*D^2 + 15*D; the reference's own default of 128 is 32x larger and
     # would make an iso-parameter grid impossible. See src/models/bdh_arm.py.
     neuron_multiplier: int = 4
-    # Route both arms through their Pallas kernels. Parameter trees and
-    # values are unchanged (tests/test_kernels.py), so this is purely an
-    # execution choice and can be flipped per run.
+    # Route the set encoders and both arms through their Pallas kernels.
+    # Parameter trees and values are unchanged (tests/test_kernels.py), so
+    # this is purely an execution choice and can be flipped per run.
     fused_kernels: bool = False
     # Sow BDH's realised activation density so a *trained* model can be
     # measured, not just a freshly initialised arm. Off by default: it costs
@@ -117,6 +117,7 @@ class PickModel(nn.Module):
             num_layers=config.pack_encoder_layers,
             mode=config.set_encoder_mode,
             mlp_ratio=config.mlp_ratio,
+            fused=config.fused_kernels,
             name="pack_encoder",
         )(pack_embeddings, pack_mask)
 
@@ -126,6 +127,7 @@ class PickModel(nn.Module):
             num_layers=config.pool_encoder_layers,
             mode=config.set_encoder_mode,
             mlp_ratio=config.mlp_ratio,
+            fused=config.fused_kernels,
             name="pool_encoder",
         )(pool_embeddings, pool_mask)
 
