@@ -215,6 +215,10 @@ class Drafter:
         One name at a time would make a caller with a mistyped pack fix it
         one round trip per card.
         """
+        # Materialised before the loop: counting the input afterwards would
+        # re-iterate it, and a caller who passed a generator would be told
+        # their bad names were "3 of 0".
+        names = list(names)
         ids: list[int] = []
         failures: list[str] = []
         for name in names:
@@ -224,7 +228,7 @@ class Drafter:
                 failures.append(str(error))
         if failures:
             raise UnknownCardError(
-                f"{len(failures)} of {len(list(names))} card names were not "
+                f"{len(failures)} of {len(names)} card names were not "
                 "recognised:\n  " + "\n  ".join(failures)
             )
         return ids

@@ -129,6 +129,18 @@ def test_every_bad_name_is_reported_at_once(corpus):
     assert "Nope One" in message and "Nope Two" in message
 
 
+def test_the_count_survives_a_one_shot_iterable(corpus):
+    """The tally is taken from the names as read, not by re-reading them.
+
+    A generator is empty the second time round, so counting it after the
+    loop reported every failure as "n of 0".
+    """
+    drafter = _drafter(corpus)
+    with pytest.raises(UnknownCardError) as error:
+        drafter.card_ids(n for n in ["Nope One", "Card 00", "Nope Two"])
+    assert "2 of 3" in str(error.value)
+
+
 def test_case_only_misses_resolve_when_unambiguous(corpus):
     drafter = _drafter(corpus)
     assert drafter.card_id("card 00") == drafter.card_id("Card 00")
