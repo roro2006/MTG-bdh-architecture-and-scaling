@@ -56,6 +56,14 @@ SET_NAME="FIN"
 ARM="attention"
 WIDTH="64"
 STEPS="3000"
+# Empty means "not given". A grid cell must be sized in epochs rather than
+# steps -- PROJECT_PLAN.md section 6 requires the D axis to be data scale, and
+# at fixed steps a small --data-fraction silently becomes many passes over
+# little data, which turns beta into a repetition exponent. run.py gives
+# --epochs precedence over --steps, so setting this makes STEPS inert.
+EPOCHS=""
+DATA_FRACTION=""
+NEURON_MULTIPLIER=""
 SEED="0"
 FUSED_KERNELS=0
 RUN_NAME=""
@@ -96,6 +104,10 @@ Cell definition (forwarded to scripts/colab_bootstrap.py):
   --arm {attention,bdh}  interaction arm                       (default: attention)
   --width N              hidden dim                            (default: 64)
   --steps N              training steps                        (default: 3000)
+  --epochs F             passes over the (subsampled) train split; overrides
+                         --steps. Use this for grid cells, not --steps.
+  --data-fraction F      subsample drafts to this fraction       (default: 1.0)
+  --neuron-multiplier N  BDH neuron width multiplier             (default: 4)
   --seed N               seed                                  (default: 0)
   --fused-kernels        run the arm through its Pallas kernel
 
@@ -177,6 +189,9 @@ while [[ $# -gt 0 ]]; do
         --arm)              ARM="${2:?--arm needs a value}"; shift 2 ;;
         --width)            WIDTH="${2:?--width needs a value}"; shift 2 ;;
         --steps)            STEPS="${2:?--steps needs a value}"; shift 2 ;;
+        --epochs)           EPOCHS="${2:?--epochs needs a value}"; shift 2 ;;
+        --data-fraction)    DATA_FRACTION="${2:?--data-fraction needs a value}"; shift 2 ;;
+        --neuron-multiplier) NEURON_MULTIPLIER="${2:?--neuron-multiplier needs a value}"; shift 2 ;;
         --seed)             SEED="${2:?--seed needs a value}"; shift 2 ;;
         --fused-kernels)    FUSED_KERNELS=1; shift ;;
         --run-name)         RUN_NAME="${2:?--run-name needs a value}"; shift 2 ;;
@@ -216,7 +231,21 @@ for pair in "MAX_SECONDS:$MAX_SECONDS" "SETUP_ALLOWANCE:$SETUP_ALLOWANCE" \
 done
 unset name value pair
 
-[[ -n "$RUN_NAME" ]] || RUN_NAME="${ARM}_d${WIDTH}_s${STEPS}"
+# The default name has to separate any two cells that are different
+# experiments. It keyed on --steps alone, which was fine while --steps was the
+# only size knob; with --epochs and --data-fraction it is not, and two grid
+# cells sharing a name means the second silently overwrites the first's
+# artefacts and then *resumes* from them.
+if [[ -z "$RUN_NAME" ]]; then
+    if [[ -n "$EPOCHS" ]]; then
+        RUN_NAME="${ARM}_d${WIDTH}_e${EPOCHS}"
+    else
+        RUN_NAME="${ARM}_d${WIDTH}_s${STEPS}"
+    fi
+    [[ -n "$DATA_FRACTION" ]] && RUN_NAME="${RUN_NAME}_f${DATA_FRACTION}"
+    [[ -n "$NEURON_MULTIPLIER" ]] && RUN_NAME="${RUN_NAME}_n${NEURON_MULTIPLIER}"
+    [[ "$SEED" != "0" ]] && RUN_NAME="${RUN_NAME}_seed${SEED}"
+fi
 
 # The run name becomes a path segment on both sides -- runs/<name> here and
 # /content/artifacts/<name> on the VM -- and `colab download` takes those
@@ -357,6 +386,9 @@ build_remote_script() {
         --artefact-root "$REMOTE_ARTIFACTS"
         --max-seconds "$MAX_SECONDS"
     )
+    [[ -n "$EPOCHS" ]] && bootstrap_argv+=(--epochs "$EPOCHS")
+    [[ -n "$DATA_FRACTION" ]] && bootstrap_argv+=(--data-fraction "$DATA_FRACTION")
+    [[ -n "$NEURON_MULTIPLIER" ]] && bootstrap_argv+=(--neuron-multiplier "$NEURON_MULTIPLIER")
     [[ "$FUSED_KERNELS" == "1" ]] && bootstrap_argv+=(--fused-kernels)
     [[ "$resume_flag" == "1" ]] && bootstrap_argv+=(--resume)
     [[ ${#EXTRA_ARGS[@]} -gt 0 ]] && bootstrap_argv+=("${EXTRA_ARGS[@]}")
@@ -423,7 +455,7 @@ cat >&2 <<PLAN
   accelerator     ${accel_desc}
   session         ${SESSION}
   run name        ${RUN_NAME}
-  cell            arm=${ARM} width=${WIDTH} steps=${STEPS} seed=${SEED} set=${SET_NAME}$([[ "$FUSED_KERNELS" == "1" ]] && printf ' fused-kernels')
+  cell            arm=${ARM} width=${WIDTH} $([[ -n "$EPOCHS" ]] && printf 'epochs=%s (--steps inert)' "$EPOCHS" || printf 'steps=%s' "$STEPS") seed=${SEED} set=${SET_NAME}$([[ -n "$DATA_FRACTION" ]] && printf ' data-fraction=%s' "$DATA_FRACTION")$([[ -n "$NEURON_MULTIPLIER" ]] && printf ' neuron-multiplier=%s' "$NEURON_MULTIPLIER")$([[ "$FUSED_KERNELS" == "1" ]] && printf ' fused-kernels')
   commit          ${GIT_COMMIT:0:8} on ${GIT_BRANCH} (pushed)
   segment budget  ${MAX_SECONDS}s training, up to ${MAX_SEGMENTS} segments
   exec timeout    ${EXEC_TIMEOUT}s  (${MAX_SECONDS} budget + ${SETUP_ALLOWANCE} staging headroom)

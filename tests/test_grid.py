@@ -22,7 +22,9 @@ from src.data.dataset import PickData, decision_rows, split_by_draft
 from src.models.pick_model import ModelConfig, count_params_analytic
 from src.training.grid import (
     ARMS,
+    CARD_FEATURE_DIM,
     D_ANCHORS,
+    DEFAULT_EPOCHS,
     FRACTIONS,
     LADDER,
     GridCell,
@@ -30,31 +32,60 @@ from src.training.grid import (
     estimate,
     full_grid,
     load_results,
+    neuron_probe,
     pilot_grid,
     run_grid,
 )
 
 
 def test_ladder_hits_its_target_parameter_counts():
-    """PROJECT_PLAN section 4 asks for ~0.5M to ~50M, log-spaced.
+    """PROJECT_PLAN section 6 asks for 4-5 log-spaced widths.
 
     The widths are hardcoded, so nothing would complain if a config default
-    changed underneath them and the ladder quietly stopped spanning two
-    decades. That would not break the fit -- it would just narrow the range
+    changed underneath them and the ladder quietly stopped spanning its
+    range. That would not break the fit -- it would just narrow the range
     alpha is estimated over, which is exactly the kind of silent damage
     section 3b's derive-don't-read discipline exists to prevent.
+
+    The bottom rung is not a target but a *measurement*: d=64 is the width
+    both arms were trained at for 92,000 steps, so 261,633 is a number the
+    ladder inherits rather than chooses.
     """
+    assert 4 <= len(LADDER) <= 5
     counts = [
-        count_params_analytic(ModelConfig(hidden_dim=d, card_feature_dim=65))["total"]
+        count_params_analytic(
+            ModelConfig(hidden_dim=d, card_feature_dim=CARD_FEATURE_DIM)
+        )["total"]
         for d in LADDER
     ]
     assert counts == sorted(counts)
-    assert counts[0] == pytest.approx(0.5e6, rel=0.1)
-    assert counts[-1] == pytest.approx(50e6, rel=0.1)
+    assert counts[0] == pytest.approx(263_745, rel=0.01)   # the measured anchor
+    assert counts[-1] / counts[0] > 50                     # enough span to fit alpha
 
     # Log-spaced: consecutive ratios should be close to constant.
     ratios = [b / a for a, b in zip(counts, counts[1:])]
     assert max(ratios) / min(ratios) < 1.35
+
+
+def test_the_ladder_starts_at_the_measured_anchor():
+    """Section 6's ladder has to include the point we already know.
+
+    The whole argument for climbing rather than moving sideways rests on
+    the d=64 result, and it only rests on it if d=64 is on the ladder --
+    otherwise the grid's cheapest point is an extrapolation from a run it
+    does not contain.
+    """
+    assert LADDER[0] == 64
+    assert 64 in D_ANCHORS
+
+
+def test_default_epochs_is_the_measured_budget_not_convergence():
+    """Three, from the 92,000-step curve. Ten is memorisation.
+
+    Guarded because it is the parameter most likely to be 'tidied' back to
+    1.0 by someone reading `cell_flops`, whose docstring says one epoch.
+    """
+    assert DEFAULT_EPOCHS == 3.0
 
 
 def test_the_grid_is_l_shaped_not_cartesian():
@@ -65,7 +96,7 @@ def test_the_grid_is_l_shaped_not_cartesian():
     every large size at every data fraction.
     """
     cells = full_grid()
-    cartesian = len(LADDER) * len(FRACTIONS) * 2 * len(ARMS)
+    cartesian = len(LADDER) * len(FRACTIONS) * len(ARMS)
     assert len(cells) < cartesian
 
     # The largest sizes appear only at full data (plus the deliberate
@@ -95,6 +126,64 @@ def test_interior_points_exist_and_are_off_the_arms():
         assert c.hidden_dim not in D_ANCHORS   # not on the D arm
 
 
+def test_interior_points_are_not_the_expensive_corner():
+    """They are a specification check, so they must not dominate the bill.
+
+    On a four-rung ladder the far corner (512, 0.5) is the second most
+    expensive cell in the whole grid -- more than the entire D arm. An
+    interior point that costs that much stops being a cheap check and
+    starts being a reason to skip the check, which is how separability
+    quietly goes unverified.
+    """
+    cells = full_grid()
+    interior = [c for c in cells if c.role == "interior"]
+    n_arm = [c for c in cells if c.role == "N"]
+    assert interior and n_arm
+
+    interior_cost = sum(cell_flops(c, 1_000) for c in interior)
+    n_cost = sum(cell_flops(c, 1_000) for c in n_arm)
+    assert interior_cost < 0.5 * n_cost
+
+
+def test_the_neuron_probe_moves_the_neuron_axis_and_says_so_in_the_name():
+    """Unpinning `neuron_multiplier` only helps if a cell records it.
+
+    Two failures this guards. A multiplier that never reaches ModelConfig
+    would produce three identical runs reported as a sweep; and a name that
+    ignored the multiplier would make the second cell look already-done and
+    silently skip it, since `run_grid` resumes on filename alone.
+    """
+    cells = neuron_probe()
+    assert len({c.name for c in cells}) == len(cells)
+    assert all(c.architecture == "bdh" for c in cells)
+    assert all(c.role == "neuron" for c in cells)
+
+    multipliers = [c.neuron_multiplier for c in cells]
+    assert multipliers == sorted(multipliers)
+    assert all(c.config().neuron_multiplier == c.neuron_multiplier for c in cells)
+
+    # A wider neuron space is a bigger model, which is the reason the probe
+    # is read per parameter rather than per multiplier.
+    counts = [c.num_params for c in cells]
+    assert counts == sorted(counts)
+    assert counts[-1] > counts[0]
+
+
+def test_the_default_multiplier_leaves_existing_cell_names_untouched():
+    """Result files written before the axis existed must still resume.
+
+    `run_grid` skips a cell when its file is present, so a name change
+    would rerun every completed cell in a Drive directory -- the exact
+    failure the resume logic exists to prevent, arriving as a silent
+    rerun rather than an error.
+    """
+    assert GridCell("bdh", 64, 1.0, 0).name == "bdh_d64_f1_s0"
+    assert GridCell("bdh", 64, 1.0, 0, neuron_multiplier=4).name == "bdh_d64_f1_s0"
+    assert (
+        GridCell("bdh", 64, 1.0, 0, neuron_multiplier=8).name == "bdh_d64_f1_s0_n8"
+    )
+
+
 def test_cells_are_ordered_most_expensive_first():
     """A session that dies mid-grid should have done the expensive work."""
     cells = full_grid()
@@ -107,7 +196,7 @@ def test_cell_names_are_unique_and_filename_safe():
     that had never run, and a '.' in a fraction would fragment the file
     stem.
     """
-    for grid in (pilot_grid(), full_grid()):
+    for grid in (pilot_grid(), full_grid(), neuron_probe()):
         names = [c.name for c in grid]
         assert len(names) == len(set(names))
         assert all(set(n) <= set("abcdefghijklmnopqrstuvwxyz0123456789_") for n in names)

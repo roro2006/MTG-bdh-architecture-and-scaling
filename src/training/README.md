@@ -8,8 +8,8 @@ The single-cell runner, the pilot grid, and the curve fit for $L(N, D) = E + A/N
 | `evaluate.py` | exact full-split eval + per-pick breakdown | done |
 | `checkpoint.py` | save/restore params + metadata | done |
 | `run.py` | CLI entry point for a single cell | done |
-| `grid.py` | the sweep | not started |
-| `scaling_fit.py` | the curve fit | not started |
+| `grid.py` | the sweep | designed and tested, not yet run |
+| `scaling_fit.py` | the curve fit | done, tested on planted laws |
 
 ## The fit is a sizing procedure
 
@@ -17,18 +17,31 @@ $L(N, D)$ is not fit here to make a claim about scaling exponents. It is fit so 
 
 It follows Chinchilla's robust procedure: Huber loss on log-residuals rather than least squares on raw loss, since raw least squares over-weights the small-$N$, high-loss corner, with bootstrapped confidence intervals rather than bare point estimates.
 
+Three things about it are worth knowing before reading a number out of it.
+
+**It fits the exact picks-0-8 loss**, which `grid.run_cell` records under `summary` using the same `summarise_by_pick` that `run.py` writes. `best_val_loss` is a *sampled* all-picks number and is not the same quantity; a result file without the summary raises rather than falling back to it.
+
+**Interior cells are held out**, and their residuals are reported alongside the fit. A systematic offset there means the separable form is wrong — which is the only thing in the design that can detect it, since the L-shape's two arms each fold an interaction term into their own coefficient.
+
+**`compute_axis="flops"` puts per-example dense FLOPs on the cost axis, not total training FLOPs.** Total FLOPs travels with every point and is the budget the arms' curves are compared at (`compare_at`), but it cannot also be the axis: along the D arm `flops_per_example` is constant, so total FLOPs is proportional to $D$ there and the two power laws collapse into one variable.
+
 ## Running one cell
 
     python -m src.training.run --processed-dir data/processed/FIN.PremierDraft \
-        --width 64 --epochs 1 --out-dir runs/attn_d64
+        --width 64 --epochs 3 --out-dir runs/attn_d64
+
+Three epochs, not one and not ten: see `grid.DEFAULT_EPOCHS` for the measured
+reason, and `docs/RESULTS.md` for the curve it was read off.
 
 `--data-fraction` is the grid's D axis. It subsamples **drafts**, not rows: a fraction drawn over rows would leave most drafts present with a few picks missing, which is a different and easier distribution than seeing fewer complete drafts.
 
 **Use `--epochs`, not `--steps`, for grid cells.** At fixed steps a small `--data-fraction` silently means many passes over a small set, and the fitted $\beta$ then measures data repetition rather than data scale. `run.py` warns past two passes.
 
-## Throughput is the current blocker
+## Throughput is no longer the blocker
 
-The pilot runs managed **561 examples/second on CPU** — `jax.default_backend()` returns `cpu` and there is one device. That is 2.3 hours per epoch at $d=64$, roughly 37 hours per epoch at $d=256$, and makes the grid infeasible. Everything downstream of the fit is gated on moving to a GPU, which for a model this size is an afternoon of rented time.
+The pilot runs managed **561 examples/second on CPU**, which was 2.3 hours per epoch at $d=64$ and made the grid infeasible. On a Colab T4 the same cells run at **17,479 ex/s (BDH)** and **19,709 ex/s (attention)** — ten epochs at $d=64$ in 45 and 40 minutes respectively, measured on the converged runs in `docs/RESULTS.md`.
+
+What replaces it as the operating constraint is session length rather than speed. A free runtime caps at 12h and is reclaimed after 90 minutes idle, so a long cell is run as a sequence of bounded segments and the resume path below is load-bearing — not a convenience for interrupted work but the normal way a cell finishes.
 
 ## Checkpoints
 

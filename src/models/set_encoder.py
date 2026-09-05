@@ -14,6 +14,11 @@ Two modes, both order-respecting in the same sense:
   - "mean": a shared per-card MLP then masked mean pooling. The simpler
     baseline named in the architecture doc, kept because it is the honest
     control for whether set attention is doing anything at all.
+
+`fused=True` swaps the attention core for the Pallas kernel in
+`kernels/set_encoder.py`, which is where the majority of the model's
+forward FLOPs live (docs/PROJECT_PLAN.md section 5). The parameter tree is
+unchanged either way, so a checkpoint reads back down either path.
 """
 
 from __future__ import annotations
@@ -77,6 +82,11 @@ class SetEncoder(nn.Module):
     num_layers: int
     mode: str = "attention"
     mlp_ratio: int = 4
+    # Route the self-attention through the Pallas kernel. Parameter tree and
+    # values are unchanged (tests/test_kernels.py), so this is an execution
+    # choice; `ModelConfig.fused_kernels` sets it for the whole model. It has
+    # no effect in "mean" mode, which has no attention to fuse.
+    fused: bool = False
 
     @nn.compact
     def __call__(
@@ -87,8 +97,14 @@ class SetEncoder(nn.Module):
 
         x = card_embeddings
         if self.mode == "attention":
+            if self.fused:
+                # Local import to keep src.models.kernels off the import path
+                # of anyone who only wants the reference blocks.
+                from .kernels.set_encoder import FusedSetAttentionBlock as Block
+            else:
+                Block = SetAttentionBlock
             for layer in range(self.num_layers):
-                x = SetAttentionBlock(
+                x = Block(
                     hidden_dim=self.hidden_dim,
                     num_heads=self.num_heads,
                     mlp_ratio=self.mlp_ratio,
