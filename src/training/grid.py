@@ -72,6 +72,7 @@ import numpy as np
 from ..data.dataset import PickData, Splits, decision_rows
 from ..models.flops import count_flops_analytic
 from ..models.pick_model import ModelConfig, count_params_analytic
+from .evaluate import DEFAULT_EVAL_BATCH, evaluate_by_pick, summarise_by_pick
 from .run import subsample_by_draft
 from .train import TrainConfig, train_model
 
@@ -366,6 +367,8 @@ def run_cell(
     eval_every: int = 250,
     drop_forced: bool = True,
     checkpoint_dir: str | Path | None = None,
+    by_pick_eval: bool = True,
+    eval_batch_size: int = DEFAULT_EVAL_BATCH,
 ) -> dict:
     """Trains one grid cell and returns what the curve fit needs.
 
@@ -380,6 +383,16 @@ def run_cell(
     fitted E is compared against a human-disagreement floor that section 7
     has already concluded must be measured where a real decision exists, so
     both sides of that comparison have to be the same population.
+
+    `by_pick_eval` is what puts the fit's y-axis in the result file, and it
+    is the same exact full-split evaluation `run.py` writes -- same
+    function, same `summary` key -- so a cell run here and a cell run by
+    hand are comparable. Without it the only loss recorded is
+    `best_val_loss`, which is *sampled* over `eval_batches` and covers all
+    fourteen picks; docs/RESULTS.md fits on the exact picks-0-8 number
+    instead, and neither of those substitutions is visible in a curve.
+    Turning it off saves one pass over the val split and costs the cell its
+    place in the fit.
     """
     train_indices = subsample_by_draft(
         data, splits.train, cell.data_fraction, seed=cell.seed
@@ -404,7 +417,7 @@ def run_cell(
         verbose=True, checkpoint_dir=checkpoint_dir,
     )
 
-    return {
+    record = {
         "cell": asdict(cell),
         "name": cell.name,
         "role": cell.role,
@@ -437,6 +450,20 @@ def run_cell(
         "history": result["history"],
         "elapsed_s": time.time() - started,
     }
+
+    if by_pick_eval:
+        # Evaluated at the best-val parameters, which are what the
+        # checkpoint holds and what any later analysis loads. Scoring the
+        # final ones instead would put a different model's loss on the
+        # curve than the one this cell ships.
+        by_pick = evaluate_by_pick(
+            result["model"], result["best_params"], feature_table,
+            data, splits.val, eval_batch_size,
+        )
+        record["by_pick"] = by_pick
+        record["summary"] = summarise_by_pick(by_pick)
+
+    return record
 
 
 def run_grid(
@@ -482,7 +509,15 @@ def run_grid(
         # always means a finished cell rather than an interrupted one.
         target.write_text(json.dumps(result, indent=2), encoding="utf-8")
         results.append(result)
-        print(f"[{i}/{len(cells)}] {cell.name}: best val {result['best_val_loss']:.4f}")
+        # The picks-0-8 number is the one the fit uses and the one
+        # docs/RESULTS.md quotes, so it is what a session's log should show;
+        # best_val_loss is sampled and covers the forced picks too.
+        headline = result.get("summary", {}).get("decision_picks", {}).get("loss")
+        measured = "" if headline is None else f" | picks 0-8 {headline:.4f}"
+        print(
+            f"[{i}/{len(cells)}] {cell.name}: best val "
+            f"{result['best_val_loss']:.4f}{measured}"
+        )
 
     return results
 
