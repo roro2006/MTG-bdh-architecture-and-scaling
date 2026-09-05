@@ -1,4 +1,4 @@
-"""Custom Pallas kernels for the two interaction arms.
+"""Custom Pallas kernels for the set encoders and the two interaction arms.
 
 Both arms have a fused kernel here, deliberately. The BDH kernel is a
 *validity* fix -- without it the memory traffic and arithmetic that BDH's
@@ -14,8 +14,15 @@ two agree on values *and* on every gradient. The attention arm is the
 control for the whole project; a silently wrong kernel in the control would
 invalidate the grid, and a parameter-count test would not catch it.
 
-Use them through `CrossAttentionArm(fused=True)` and `BDHArm(fused=True)`,
-or `ModelConfig(fused_kernels=True)`, rather than by reaching in here --
+The set-encoder kernel is a third kind of need again. It is neither a
+validity fix nor a marginal speed fix: the encoders are 63-74% of forward
+FLOPs and ran entirely on `nn.MultiHeadDotProductAttention`, so without it
+the project's "attention-shaped operations are hand-written" commitment
+described a minority of the arithmetic (docs/PROJECT_PLAN.md section 5).
+
+Use them through `SetEncoder(fused=True)`, `CrossAttentionArm(fused=True)`
+and `BDHArm(fused=True)`, or `ModelConfig(fused_kernels=True)` for all
+three at once, rather than by reaching in here --
 the fused blocks carry parameter trees identical to the reference blocks,
 so the switch is invisible to everything downstream.
 
@@ -43,15 +50,25 @@ from .cross_attention import (
     fused_attention,
     reference_attention,
 )
+from .set_encoder import (
+    FusedSetAttentionBlock,
+    benchmark_set_attention,
+    fused_set_attention,
+    reference_set_attention,
+)
 
 __all__ = [
     "FusedBDHBlock",
     "FusedCrossAttentionBlock",
+    "FusedSetAttentionBlock",
     "bdh_gate_decode",
     "bdh_scores",
+    "benchmark_set_attention",
     "default_interpret",
     "fused_attention",
+    "fused_set_attention",
     "reference_attention",
     "reference_gate_decode",
     "reference_scores",
+    "reference_set_attention",
 ]
