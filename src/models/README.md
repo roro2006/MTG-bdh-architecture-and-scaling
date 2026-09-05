@@ -5,10 +5,10 @@ Two interaction arms sharing one front end (see `docs/ARCHITECTURE.md`). Everyth
 | file | role | status |
 |---|---|---|
 | `embeddings.py` | composite card embeddings + pack/pick context features | done |
-| `set_encoder.py` | permutation-invariant pack and pool encoders | done (flax attention; kernel pending) |
+| `set_encoder.py` | permutation-invariant pack and pool encoders | done (flax attention, or the Pallas kernel under `fused=True`) |
 | `attention_arm.py` | pool-to-pack cross-attention | done |
 | `bdh_arm.py` | JAX port of BDH's sparse/Hebbian block | done |
-| `kernels/` | hand-written Pallas kernels | arms done; set encoder pending |
+| `kernels/` | hand-written Pallas kernels | both arms and the set encoder done; none benchmarked on hardware |
 | `pick_model.py` | assembly, pointer head, analytic parameter counts | done |
 
 ## Card embeddings are composed, not looked up
@@ -46,12 +46,12 @@ Asserted in the architecture doc and enforced in `tests/test_models.py`:
 
 The two arms solve opposite problems. Cross-attention is small enough that a whole `(batch, head)` slice fits in SRAM — pack ≤ 14, pool ≤ 42 — so the kernel skips FlashAttention's tiling and online softmax entirely and does forward and backward in one block each, keeping only the log-sum-exp so the backward can reconstruct the probabilities. BDH's problem is the reverse: its `(B, nh, L, N)` neuron tensors are the largest things in the model and needed nowhere outside the block, so the neuron axis becomes a sequential grid dimension and never reaches HBM.
 
-**The gap:** `set_encoder.py:49` still calls `nn.MultiHeadDotProductAttention`, and the set encoders are 58% of parameters — 63–74% of forward FLOPs run outside the arm. A kernel for the set encoder's masked, position-free self-attention closes it and is an explicit build-order item.
+**The gap, now closed:** the set encoders are 58% of parameters and 63–74% of forward FLOPs run outside the arm, all of it formerly on `nn.MultiHeadDotProductAttention`. `kernels/set_encoder.py` is the kernel for that masked, position-free self-attention. `fused=True` selects it, leaving the parameter tree and the values untouched, so which path runs is an execution choice and not a model one.
 
 Three things worth knowing before using these:
 
 - **They win memory traffic, not FLOPs.** Unstructured zeros still occupy a tensor-core lane. See the accounting section in `docs/ARCHITECTURE.md`.
-- **They are correct but unmeasured.** On a CPU-only box the tests run under Pallas's `interpret=True`, which checks semantics but not lowering and does no fusion at all. Set `KERNEL_INTERPRET=0` on a GPU or TPU to exercise the real thing, and benchmark against the references before claiming anything.
+- **They are correct but unmeasured.** On a CPU-only box the tests run under Pallas's `interpret=True`, which checks semantics but not lowering and does no fusion at all. Set `KERNEL_INTERPRET=0` on a GPU or TPU to exercise the real thing, and benchmark against the references before claiming anything. This has not happened yet: the T4 runs in `docs/RESULTS.md` were trained with `fused_kernels: false`, so no kernel here has ever been lowered on an accelerator.
 - **A fully-masked query row is defined as zero**, not as flax's uniform-softmax-over-everything. Those rows are padded pack slots that `PointerHead` discards; flax's value for them depends on how far the key axis happens to be padded, which would make the same model give different numbers at different block sizes. `EMPTY_ROW_NOTE` in `kernels/cross_attention.py` has the detail.
 
 `tests/test_kernels.py` asserts every kernel against a pure-JAX reference on values *and* on every gradient, and both fused arms against their reference arms under one shared parameter set. That is stricter than it may look necessary: a wrong kernel would not fail visibly, it would produce plausible numbers that happen to be false, and a parameter-count test cannot catch it.

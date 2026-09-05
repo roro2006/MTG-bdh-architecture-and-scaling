@@ -75,16 +75,18 @@ Current state against that commitment:
 
 | | share of params | share of forward FLOPs |
 |---|---|---|
-| set encoders (pack + pool) — flax built-ins | 58% | — |
+| set encoders (pack + pool) — hand-written Pallas | 58% | — |
 | interaction arm — hand-written Pallas | 39% | 26% (attention) / 37% (BDH) |
 | everything outside the arm | — | 63–74% |
 
-So the majority of the arithmetic still runs on `nn.MultiHeadDotProductAttention` (`set_encoder.py:49`). **Closing that gap — a Pallas kernel for the set encoder's masked, position-free self-attention — is a first-class task in the build order**, not an implied one. It is the same shape as the cross-attention kernel already written.
+**That gap is now closed.** `kernels/set_encoder.py` is a Pallas kernel for the set encoder's masked, position-free self-attention — the same shape as the cross-attention kernel, and the last of the forward FLOPs that ran on `nn.MultiHeadDotProductAttention`. `fused=True` swaps it in; the parameter tree and the values are unchanged, so it is an execution choice rather than a model one, and `tests/test_kernels.py` asserts that against the flax reference on values and on every gradient.
+
+What remains in XLA after it is LayerNorm, Dense, softmax and the elementwise ops — the deliberate scope boundary above, not a residue. Every attention-shaped operation in the forward pass is now hand-written.
 
 Two standing facts about the existing kernels, both of which belong in any writeup:
 
 - **They win memory traffic, not FLOPs.** Unstructured zeros still occupy a tensor-core lane; a GPU multiplies by zero as fast as by anything else. Turning BDH's FLOP advantage into wall-clock needs block-structured sparsity, which is an architectural change rather than a kernel one.
-- **They are correct but unmeasured.** Every kernel is asserted against a pure-JAX reference on values and on every gradient. None has run on real hardware — `default_interpret()` returns True off GPU/TPU, and interpret mode executes kernel semantics in pure JAX with no fusion at all. The first GPU session should re-run the kernel tests with `KERNEL_INTERPRET=0` and benchmark fused against reference across widths and neuron multipliers.
+- **They are correct but unmeasured.** Every kernel is asserted against a pure-JAX reference on values and on every gradient. None has run on real hardware — `default_interpret()` returns True off GPU/TPU, and interpret mode executes kernel semantics in pure JAX with no fusion at all. The T4 sessions that produced the converged runs did not close this: both arms were trained with `fused_kernels: false`, so the accelerator has still only ever executed the flax path. Re-running the kernel tests with `KERNEL_INTERPRET=0` and benchmarking fused against reference across widths and neuron multipliers is the outstanding work, and it needs a GPU session of its own rather than a spare corner of a training one.
 
 ## 6. Sizing the drafter
 
@@ -135,7 +137,7 @@ External validation against CubeCobra co-occurrence is the follow-up, and is wha
 
 ## 9. Risks worth naming up front
 
-- **CPU-only training is the binding constraint on everything.** 561 examples/second means 2.3 hours per epoch at $d=64$ and makes the grid impossible. Nothing downstream is real until this is fixed, and the fix is cheap.
+- ~~**CPU-only training is the binding constraint on everything.**~~ Retired. 561 examples/second on CPU became 17,479 (BDH) and 19,709 (attention) on a T4 — a 31–35× move that took one afternoon, and the grid is now a compute question rather than an impossible one. The risk it leaves behind is smaller and worth naming: a free Colab runtime caps at 12h and is reclaimed after 90 minutes idle, so every long cell is a sequence of resumable segments, and the resume path is load-bearing rather than a convenience.
 - **Synergy may be a thin signal in the data.** Human drafters at scale pick largely on card quality and colour; genuine synergy picks are a minority of decisions. The synergy probe exists to detect a null result honestly rather than to confirm a hoped-for one.
 - **Structured mechanical features are hand-specified and therefore incomplete.** They will miss mechanics nobody thought to pattern-match. The probe and the held-out-set evaluation are what surface that.
 - **Zero-shot numbers are easy to over-read.** Without the same-set ceiling and the prior baseline reported alongside, a plausible-looking figure means nothing.
@@ -151,7 +153,9 @@ External validation against CubeCobra co-occurrence is the follow-up, and is wha
 6. **Zero-shot probe** at one size: train on $n-1$ sets, test on the held-out one.
 7. **Neuron probe**, then **pilot grid and fit**, on the settled representation. `grid.neuron_probe` is three cells and comes first, because a grid committed at `neuron_multiplier=4` cannot answer the question §4 reopened.
 8. **Train the drafter** at $(N^*, D^*)$ with the winning arm.
-9. **Set-encoder Pallas kernel**, closing the from-scratch gap in §5.
-10. **Inference entry point and CLI**, then the writeup.
+9. ~~**Set-encoder Pallas kernel**, closing the from-scratch gap in §5.~~ Done: `kernels/set_encoder.py`, and with it every attention-shaped forward operation is hand-written. Still unbenchmarked on hardware, per §5.
+10. ~~**Inference entry point and CLI**~~ Done: `src/inference/`, taking names rather than ids and reporting top-1, top-3 and calibration on both slices. **The writeup remains.**
 
 Steps 1–3 unblock everything. Step 4 before step 5 is deliberate: without the probe, step 5 can only tell you the loss moved, not why.
+
+**Steps 9 and 10 were taken early, out of order.** Both were cheap, self-contained and did not depend on the grid, and the inference entry point in particular was worth having before the sizing runs rather than after — it is how a checkpoint gets looked at rather than only scored. That leaves the remaining work as steps 5–8, which are the ones that need compute and a decision, in that order.

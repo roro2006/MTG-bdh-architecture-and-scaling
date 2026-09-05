@@ -37,9 +37,11 @@ reason, and `docs/RESULTS.md` for the curve it was read off.
 
 **Use `--epochs`, not `--steps`, for grid cells.** At fixed steps a small `--data-fraction` silently means many passes over a small set, and the fitted $\beta$ then measures data repetition rather than data scale. `run.py` warns past two passes.
 
-## Throughput is the current blocker
+## Throughput is no longer the blocker
 
-The pilot runs managed **561 examples/second on CPU** — `jax.default_backend()` returns `cpu` and there is one device. That is 2.3 hours per epoch at $d=64$, roughly 37 hours per epoch at $d=256$, and makes the grid infeasible. Everything downstream of the fit is gated on moving to a GPU, which for a model this size is an afternoon of rented time.
+The pilot runs managed **561 examples/second on CPU**, which was 2.3 hours per epoch at $d=64$ and made the grid infeasible. On a Colab T4 the same cells run at **17,479 ex/s (BDH)** and **19,709 ex/s (attention)** — ten epochs at $d=64$ in 45 and 40 minutes respectively, measured on the converged runs in `docs/RESULTS.md`.
+
+What replaces it as the operating constraint is session length rather than speed. A free runtime caps at 12h and is reclaimed after 90 minutes idle, so a long cell is run as a sequence of bounded segments and the resume path below is load-bearing — not a convenience for interrupted work but the normal way a cell finishes.
 
 ## Checkpoints
 

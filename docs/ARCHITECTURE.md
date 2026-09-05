@@ -94,19 +94,21 @@ The two arms already meet it, and they solve opposite problems. Cross-attention 
 
 The backward pass is deliberately two kernels rather than one. Activation gradients and weight gradients reduce along opposite axes — `dxq` sums over heads and neuron tiles, `d_enc` sums over the batch. Doing both in one kernel would need float atomics, which accumulate in nondeterministic order, and run-to-run reproducibility is not negotiable when runs are being compared against each other. Two kernels with different grids, each reducing over a sequential axis it owns: slightly more recomputation, exactly reproducible.
 
-### The gap
+### The gap, and how it was closed
 
-The commitment is not yet met. `nn.MultiHeadDotProductAttention` is still used at `set_encoder.py:49`, and the set encoders are the larger part of the model:
+The set encoders are the larger part of the model, and until `kernels/set_encoder.py` all of that ran on `nn.MultiHeadDotProductAttention`:
 
 | | share of params | share of forward FLOPs |
 |---|---|---|
-| set encoders — flax built-ins | 58% | — |
+| set encoders — hand-written | 58% | — |
 | interaction arm — hand-written | 39% | 26% (attention) / 37% (BDH) |
 | everything outside the arm | — | 63–74% |
 
-A Pallas kernel for the set encoder's masked, position-free self-attention closes it. It is the same shape as the cross-attention kernel already written, and it is an explicit item in the build order rather than an aspiration.
+The kernel for the set encoder's masked, position-free self-attention is the same shape as the cross-attention kernel, and with it the commitment is met: every attention-shaped operation in the forward pass is hand-written, and what stays in XLA is the LayerNorm/Dense/elementwise work the scope deliberately excludes.
+
+`fused=True` selects it. The parameter tree and the values are identical either way, so the choice is about execution rather than about the model — which is what makes the flax path usable as the reference `tests/test_kernels.py` asserts against, on values and on every gradient.
 
 ### Two standing caveats
 
 - **Kernels win memory traffic, not arithmetic.** Unstructured zeros still occupy a lane in a tensor-core tile, so a GPU multiplies by zero exactly as fast as by anything else. Anything reported on a wall-clock axis should say which of the two it means. Realising BDH's FLOP advantage as time needs block-structured sparsity — an architectural change, not a kernel one.
-- **They are correct but unmeasured.** Every kernel is asserted against a pure-JAX reference on values *and* on every gradient, and both fused arms against their reference arms under one shared parameter set. But `default_interpret()` returns True off GPU/TPU, and interpret mode runs kernel semantics in pure JAX with no fusion — so nothing here has a performance number attached yet. Set `KERNEL_INTERPRET=0` on real hardware to exercise the lowering.
+- **They are correct but unmeasured.** Every kernel is asserted against a pure-JAX reference on values *and* on every gradient, and both fused arms against their reference arms under one shared parameter set. But `default_interpret()` returns True off GPU/TPU, and interpret mode runs kernel semantics in pure JAX with no fusion — so nothing here has a performance number attached yet. Set `KERNEL_INTERPRET=0` on real hardware to exercise the lowering. The T4 sessions behind `docs/RESULTS.md` did not do this: both converged runs were trained with `fused_kernels: false`, so an accelerator has still only ever run the flax path.
