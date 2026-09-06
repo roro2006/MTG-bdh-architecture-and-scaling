@@ -63,6 +63,11 @@ HELD_OUT=""
 # and ingest them. See upload_processed().
 UPLOAD_PROCESSED=0
 REMOTE_CACHE="/content/processed_cache"
+# Attach to a session that is already up instead of provisioning a new one.
+# Staging nine sets costs the better part of an hour, and a second cell on the
+# same corpora should not pay it twice; `git reset --hard` leaves gitignored
+# data/ and runs/ alone, so a reused VM keeps both.
+REUSE_SESSION=0
 ARM="attention"
 WIDTH="64"
 STEPS="3000"
@@ -127,10 +132,14 @@ Zero-shot cross-set (src/training/transfer.py):
                          Must be one of --sets.
   --upload-processed     push the locally ingested corpora to the VM instead of
                          having it download ~200MB and ingest ~283s PER SET.
-                         Nine sets is ~550MB up against ~45min of VM work, and
-                         the arrays are then byte-identical to the ones the
-                         local tests ran against.
+                         NOTE: the Colab contents API returns 500 on a file of
+                         ~68MB, so this currently only works for corpora whose
+                         picks.npz is small. Nine real sets need the download
+                         path and a --setup-allowance of ~6000.
   --remote-cache PATH    where those uploads land  (default: /content/processed_cache)
+  --reuse-session        attach to --session if it is already running instead of
+                         provisioning. Pair with --keep on the first cell to run
+                         several cells against one staging.
 
 Session control:
   --run-name NAME        artefact directory name    (default: <arm>_d<width>_s<steps>)
@@ -210,6 +219,7 @@ while [[ $# -gt 0 ]]; do
         --sets)             SETS="${2:?--sets needs a value}"; shift 2 ;;
         --held-out)         HELD_OUT="${2:?--held-out needs a value}"; shift 2 ;;
         --upload-processed) UPLOAD_PROCESSED=1; shift ;;
+        --reuse-session)    REUSE_SESSION=1; shift ;;
         --remote-cache)     REMOTE_CACHE="${2:?--remote-cache needs a value}"; shift 2 ;;
         --arm)              ARM="${2:?--arm needs a value}"; shift 2 ;;
         --width)            WIDTH="${2:?--width needs a value}"; shift 2 ;;
@@ -653,14 +663,21 @@ upload_processed() {
 # Provision and run
 # --------------------------------------------------------------------------
 
-log "provisioning ${accel_desc} as session '${SESSION}'..."
-new_args=(new -s "$SESSION")
-[[ -n "$GPU" ]] && new_args+=(--gpu "$GPU")
-[[ -n "$TPU" ]] && new_args+=(--tpu "$TPU")
-colab_cmd "${new_args[@]}" || die "could not provision ${accel_desc}.
+if [[ "$REUSE_SESSION" == "1" ]] && colab_cmd status -s "$SESSION" >/dev/null 2>&1; then
+    log "reusing the running session '${SESSION}' -- its staged data and
+[driver] earlier artefacts are gitignored, so the checkout to this commit keeps them"
+    # Still ours to release: cleanup stops it unless --keep says otherwise.
+    PROVISIONED=1
+else
+    log "provisioning ${accel_desc} as session '${SESSION}'..."
+    new_args=(new -s "$SESSION")
+    [[ -n "$GPU" ]] && new_args+=(--gpu "$GPU")
+    [[ -n "$TPU" ]] && new_args+=(--tpu "$TPU")
+    colab_cmd "${new_args[@]}" || die "could not provision ${accel_desc}.
 A 400 here usually means the account has no entitlement for this accelerator
 on its current tier. Fall back to --gpu T4, or omit the flag for CPU."
-PROVISIONED=1
+    PROVISIONED=1
+fi
 
 colab_cmd status -s "$SESSION" || true
 

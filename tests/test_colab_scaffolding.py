@@ -371,3 +371,26 @@ def test_upload_covers_every_file_the_loader_needs():
     # ingest_stats.json is not a marker but carries the pack geometry, and a
     # corpus loaded without it falls back to inferring one.
     assert "ingest_stats.json" in uploaded
+
+
+def test_reused_sessions_are_still_released():
+    """--reuse-session must not leak the teardown.
+
+    `cleanup` only stops what it believes the run provisioned. If attaching
+    to a running session left PROVISIONED at 0, the last cell of a series
+    would exit without stopping the VM and it would bill to the 24h
+    keep-alive cap with nobody watching -- the third failure mode this
+    driver's header names.
+    """
+    source = DRIVER.read_text(encoding="utf-8")
+
+    start = source.index('if [[ "$REUSE_SESSION" == "1" ]]')
+    end = source.index("segment=0", start)
+    branch = source[start:end]
+
+    # Both arms of the provision-or-attach choice claim the session.
+    assert branch.count("PROVISIONED=1") == 2, (
+        "one path through provisioning does not mark the session as ours to "
+        "stop; cleanup would leave it running"
+    )
+    assert "--reuse-session)" in source
