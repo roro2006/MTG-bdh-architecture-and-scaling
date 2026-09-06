@@ -416,16 +416,36 @@ def _download(url: str, dest: Path) -> None:
 
 
 def build_training_argv(args: argparse.Namespace, processed: Path, out_dir: Path) -> list[str]:
-    """Maps this script's flags onto src/training/run.py's.
+    """Maps this script's flags onto src/training/run.py's, or transfer.py's.
 
     Every flag run.py accepts is reachable from here. A flag that could only
     be set by editing the bootstrap would mean grid cells that cannot be
     reproduced from a single command, which is the property run.py's own
     docstring is protecting.
+
+    `--held-out` swaps the entry point for src/training/transfer.py. The two
+    share every sizing flag; they differ only in what they are pointed at --
+    one processed directory against the root holding all of them.
     """
+    if args.held_out:
+        # Named explicitly rather than letting transfer.py default to
+        # "everything ingested under the root". On a VM those are the same
+        # list, but saying it means a set that fails to load is an error
+        # here rather than a silently smaller training corpus.
+        train_sets = [s for s in args.sets if s != args.held_out]
+        head = [
+            sys.executable, "-m", "src.training.transfer",
+            "--processed-root", str(processed.parent),
+            "--held-out", args.held_out,
+            "--train-sets", *train_sets,
+        ]
+    else:
+        head = [
+            sys.executable, "-m", "src.training.run",
+            "--processed-dir", str(processed),
+        ]
     argv = [
-        sys.executable, "-m", "src.training.run",
-        "--processed-dir", str(processed),
+        *head,
         "--out-dir", str(out_dir),
         "--arm", args.arm,
         "--width", str(args.width),
@@ -546,6 +566,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--train-set", default=None,
                         help="which staged set to train on (default: the first "
                              "of --sets)")
+    parser.add_argument("--held-out", default=None,
+                        help="run the zero-shot cross-set protocol instead of a "
+                             "single-set cell: train on every staged set except "
+                             "this one and evaluate on it. Routes to "
+                             "src/training/transfer.py rather than run.py, and "
+                             "makes --sets load-bearing rather than just a way "
+                             "to warm a cache.")
     parser.add_argument("--ref", default=DEFAULT_REF,
                         help="git ref to check out (default: %(default)s)")
     parser.add_argument("--work-root", default="/content",
@@ -624,7 +651,11 @@ def default_run_name(args: argparse.Namespace, set_code: str) -> str:
     """
     short = {"attention": "attn", "bdh": "bdh"}[args.arm]
     size = f"e{args.epochs:g}" if args.epochs is not None else f"s{args.steps}"
-    name = f"{short}_d{args.width}_{set_code}_{size}"
+    # A transfer cell and a same-set cell at the same arm, width and size are
+    # entirely different experiments that would otherwise share a name, land
+    # in one artefact directory, and resume each other's state.
+    prefix = "transfer_" if args.held_out else ""
+    name = f"{prefix}{short}_d{args.width}_{set_code}_{size}"
     if args.fused_kernels:
         name += "_fused"
     if args.data_fraction < 1.0:
@@ -676,12 +707,36 @@ def main(argv: list[str] | None = None) -> int:
     for set_code in args.sets:
         stage_set(repo, set_code, Path(args.cache_dir) if args.cache_dir else None)
 
-    train_set = args.train_set or args.sets[0]
-    processed = processed_dir_for(repo, train_set)
-    if not is_staged(processed):
-        raise SystemExit(
-            f"--train-set {train_set} is not among the staged sets {args.sets}"
-        )
+    if args.held_out:
+        # A transfer cell reads every staged set, so every one of them has to
+        # be there -- a missing set would silently become a smaller training
+        # corpus and a loss that cannot be compared to anything.
+        missing = [
+            code for code in args.sets
+            if not is_staged(processed_dir_for(repo, code))
+        ]
+        if missing:
+            raise SystemExit(f"staging left {missing} incomplete; cannot train")
+        if args.held_out not in args.sets:
+            raise SystemExit(
+                f"--held-out {args.held_out} must also be in --sets: it is "
+                "what the run evaluates on, so it has to be staged"
+            )
+        if len(args.sets) < 2:
+            raise SystemExit(
+                "--held-out needs at least one other set to train on"
+            )
+        # STATUS.json's `set` is "the set this run is about", which for a
+        # transfer cell is the one held out.
+        train_set = args.held_out
+        processed = processed_dir_for(repo, train_set)
+    else:
+        train_set = args.train_set or args.sets[0]
+        processed = processed_dir_for(repo, train_set)
+        if not is_staged(processed):
+            raise SystemExit(
+                f"--train-set {train_set} is not among the staged sets {args.sets}"
+            )
 
     if args.stage_only:
         print(f"\nstaged {args.sets} in {time.monotonic() - started:,.0f}s; "
@@ -716,6 +771,10 @@ def main(argv: list[str] | None = None) -> int:
         "device_kind": after.get("device_kind"),
         "jax": after.get("jax"),
         "set": train_set,
+        "held_out": args.held_out,
+        "train_sets": (
+            [s for s in args.sets if s != args.held_out] if args.held_out else None
+        ),
         "arm": args.arm,
         "width": args.width,
         "fused_kernels": args.fused_kernels,
