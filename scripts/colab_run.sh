@@ -316,7 +316,10 @@ if [[ -z "$SESSION" ]]; then
 fi
 
 readonly EXEC_TIMEOUT=$(( MAX_SECONDS + SETUP_ALLOWANCE ))
-readonly LOCAL_ARTIFACTS="${REPO_ROOT}/runs/${RUN_NAME}"
+# Overridable because REPO_ROOT can be a git worktree, which is deleted with
+# the session that made it. A run costs a GPU and hours; its artefacts should
+# be able to outlive the checkout that launched it.
+readonly LOCAL_ARTIFACTS="${MTG_RUNS_ROOT:-${REPO_ROOT}/runs}/${RUN_NAME}"
 readonly REMOTE_RUN_DIR="${REMOTE_ARTIFACTS}/${RUN_NAME}"
 
 # --------------------------------------------------------------------------
