@@ -117,6 +117,35 @@ The through-line above is that the expensive failures were the quiet ones. `Pick
 
 The Scryfall JSON for each set is cached under `data/raw/scryfall/<SET>.json`, so rebuilding features does not re-hit the API.
 
+### Loading them as one corpus
+
+Nine ingested sets are nine id spaces. Every `vocab.json` starts at 0, so card 0 is `Abhorrent Oculus` in DSK and `Abomination of Llanowar` in MH3, and concatenating the arrays without a remap produces a corpus in which every id means several different cards at once. `src/data/multiset.py` builds the shared index that makes them one corpus:
+
+    from src.data.multiset import load_multiset, processed_dirs
+    corpus = load_multiset(processed_dirs("data/processed",
+                                          ["BLB", "DSK", "EOE", "HBG", "LCI",
+                                           "MH3", "OTJ", "SIR", "FIN"]))
+
+**Reprints get one global id, keyed on card name.** 20 of the 2,817 distinct cards are printed in more than one of the nine sets — 55 repeated slots out of 2,872, most of them basic lands. Three reasons that is the right merge and not merely the convenient one:
+
+- It is invisible to the model either way. `CardEmbedding` is an MLP over the feature row, so two ids carrying identical rows cannot be told apart in the forward pass. Splitting a reprint into per-set ids would be a distinction with no representation behind it.
+- The rows genuinely are identical. `card_features.py` fetches Scryfall by card *name*, never by printing, so every attribute it records — including rarity, which is a property of a printing — comes from one canonical printing. `build_card_index` re-checks rather than assuming: across all ten ingested sets, 87 reprinted names, **zero** feature-row disagreements. A disagreement raises and names the differing columns, because it would mean two sets describing different cards under one name.
+- It keeps the zero-shot claim honest. A card in a held-out set that a training set also printed really *is* the same card and the model really has seen it. Merging makes that a number worth reporting instead of hiding it behind an id space that pretends the sets are disjoint. **Held out FIN, the overlap is 8 of its 363 cards — 2.2%:** five basic lands, plus `Ancient Copper Dragon`, `Deadly Dispute` and `K'rrik, Son of Yawgmoth`.
+
+**Three things the loader refuses to do quietly**, each of which would otherwise land as a wrong number rather than an error:
+
+| refused | why it would be silent |
+|---|---|
+| concatenate feature tables of different widths, or of the same width with different columns | column *k* has to be the same attribute in every set; a shifted layout still trains |
+| merge a reprint whose feature rows disagree between sets | one row would win arbitrarily |
+| check the pool-as-prefix identity against a single geometry | see below |
+
+That last one is the geometry trap from the section above, arriving by a new road. The concatenated corpus's *envelope* geometry is 3×15, since LCI and SIR are the widest. Checking `pack_number * 15 + pick_number` against every row condemns all of BLB, DSK, EOE, HBG, MH3, OTJ and FIN — **38.1M of the corpus's 46.3M rows, 82%** — and `on_invalid="drop"` would return the surviving LCI and SIR without a word. `MultiSetPickData` overrides the check to use each row's *own* `picks_per_pack`, and `tests/test_multiset.py` asserts that the naive version fails on exactly the sets whose geometry differs from the envelope.
+
+Packs pad right to the widest (15 columns) and pools to the envelope's `max_pool_size` (44), both with `PAD_ID`, so a 3×13 set's rows keep their `label_pos` and simply carry more padding.
+
+**Splits are drawn per set, before concatenation**, then offset into the merged frame. That is what makes a held-out set's val split bit-identical to the one a single-set run of the same seed would draw — the precondition for comparing a zero-shot number against a same-set one. It is checkable, and checked: computing FIN's same-set pick-rate prior *through the merged corpus* returns 1.5662 / 45.26% over all picks and 1.9474 / 36.30% over picks 0–8, reproducing `RESULTS.md` exactly. Those four numbers can only come out right if FIN's rows, ids and splits all survived the merge unchanged.
+
 ## Card features: one column layout for every set
 
 The feature table feeding the composite embeddings (`src/data/card_features.py`) used to fit its keyword columns to whichever set it was building, keeping any Scryfall keyword carried by at least two of that set's cards. That was the right guard for a per-set fit — a keyword on one card is that card's id in disguise — but the fit itself was the problem: **column *k* was a different keyword in a different set**, so a table built on FIN meant nothing to a model reading BLB. For a project whose stated goal is drafting a set the model has never seen, that is fatal.

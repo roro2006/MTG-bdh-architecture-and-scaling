@@ -53,6 +53,21 @@ readonly VALID_TPUS="v5e1 v6e1"
 GPU=""
 TPU=""
 SET_NAME="FIN"
+# Space-separated set codes for a multi-set cell. Empty means "just
+# --set", which is every single-set run and the whole grid.
+SETS=""
+# Non-empty switches the run to the zero-shot cross-set protocol: train on
+# SETS minus this one, evaluate on this one. See src/training/transfer.py.
+HELD_OUT=""
+# Push the locally ingested corpora to the VM instead of having it download
+# and ingest them. See upload_processed().
+UPLOAD_PROCESSED=0
+REMOTE_CACHE="/content/processed_cache"
+# Attach to a session that is already up instead of provisioning a new one.
+# Staging nine sets costs the better part of an hour, and a second cell on the
+# same corpora should not pay it twice; `git reset --hard` leaves gitignored
+# data/ and runs/ alone, so a reused VM keeps both.
+REUSE_SESSION=0
 ARM="attention"
 WIDTH="64"
 STEPS="3000"
@@ -110,6 +125,21 @@ Cell definition (forwarded to scripts/colab_bootstrap.py):
   --neuron-multiplier N  BDH neuron width multiplier             (default: 4)
   --seed N               seed                                  (default: 0)
   --fused-kernels        run the arm through its Pallas kernel
+
+Zero-shot cross-set (src/training/transfer.py):
+  --sets "A B C"         all set codes to stage, space separated
+  --held-out SET         train on --sets minus this one, evaluate on this one.
+                         Must be one of --sets.
+  --upload-processed     push the locally ingested corpora to the VM instead of
+                         having it download ~200MB and ingest ~283s PER SET.
+                         NOTE: the Colab contents API returns 500 on a file of
+                         ~68MB, so this currently only works for corpora whose
+                         picks.npz is small. Nine real sets need the download
+                         path and a --setup-allowance of ~6000.
+  --remote-cache PATH    where those uploads land  (default: /content/processed_cache)
+  --reuse-session        attach to --session if it is already running instead of
+                         provisioning. Pair with --keep on the first cell to run
+                         several cells against one staging.
 
 Session control:
   --run-name NAME        artefact directory name    (default: <arm>_d<width>_s<steps>)
@@ -186,6 +216,11 @@ while [[ $# -gt 0 ]]; do
         --gpu)              GPU="${2:?--gpu needs a value}"; shift 2 ;;
         --tpu)              TPU="${2:?--tpu needs a value}"; shift 2 ;;
         --set)              SET_NAME="${2:?--set needs a value}"; shift 2 ;;
+        --sets)             SETS="${2:?--sets needs a value}"; shift 2 ;;
+        --held-out)         HELD_OUT="${2:?--held-out needs a value}"; shift 2 ;;
+        --upload-processed) UPLOAD_PROCESSED=1; shift ;;
+        --reuse-session)    REUSE_SESSION=1; shift ;;
+        --remote-cache)     REMOTE_CACHE="${2:?--remote-cache needs a value}"; shift 2 ;;
         --arm)              ARM="${2:?--arm needs a value}"; shift 2 ;;
         --width)            WIDTH="${2:?--width needs a value}"; shift 2 ;;
         --steps)            STEPS="${2:?--steps needs a value}"; shift 2 ;;
@@ -231,17 +266,41 @@ for pair in "MAX_SECONDS:$MAX_SECONDS" "SETUP_ALLOWANCE:$SETUP_ALLOWANCE" \
 done
 unset name value pair
 
+# The set list the VM stages. --sets when given, otherwise the single --set,
+# so every existing invocation keeps its behaviour.
+if [[ -n "$SETS" ]]; then
+    read -r -a STAGE_SETS <<< "$SETS"
+else
+    STAGE_SETS=("$SET_NAME")
+fi
+[[ ${#STAGE_SETS[@]} -gt 0 ]] || die "--sets is empty"
+
+if [[ -n "$HELD_OUT" ]]; then
+    found=0
+    for s in "${STAGE_SETS[@]}"; do [[ "$s" == "$HELD_OUT" ]] && found=1; done
+    (( found )) || die "--held-out ${HELD_OUT} is not in --sets (${STAGE_SETS[*]}).
+It has to be staged: it is the set the run evaluates on."
+    (( ${#STAGE_SETS[@]} >= 2 )) || die "--held-out needs at least one other set to train on"
+    unset found s
+fi
+
 # The default name has to separate any two cells that are different
 # experiments. It keyed on --steps alone, which was fine while --steps was the
 # only size knob; with --epochs and --data-fraction it is not, and two grid
 # cells sharing a name means the second silently overwrites the first's
 # artefacts and then *resumes* from them.
 if [[ -z "$RUN_NAME" ]]; then
+    # A transfer cell and a same-set cell of the same shape are different
+    # experiments; sharing a name would put them in one artefact directory
+    # and have the second resume the first's state.
+    prefix=""
+    [[ -n "$HELD_OUT" ]] && prefix="transfer_"
     if [[ -n "$EPOCHS" ]]; then
-        RUN_NAME="${ARM}_d${WIDTH}_e${EPOCHS}"
+        RUN_NAME="${prefix}${ARM}_d${WIDTH}_e${EPOCHS}"
     else
-        RUN_NAME="${ARM}_d${WIDTH}_s${STEPS}"
+        RUN_NAME="${prefix}${ARM}_d${WIDTH}_s${STEPS}"
     fi
+    unset prefix
     [[ -n "$DATA_FRACTION" ]] && RUN_NAME="${RUN_NAME}_f${DATA_FRACTION}"
     [[ -n "$NEURON_MULTIPLIER" ]] && RUN_NAME="${RUN_NAME}_n${NEURON_MULTIPLIER}"
     [[ "$SEED" != "0" ]] && RUN_NAME="${RUN_NAME}_seed${SEED}"
@@ -267,7 +326,10 @@ if [[ -z "$SESSION" ]]; then
 fi
 
 readonly EXEC_TIMEOUT=$(( MAX_SECONDS + SETUP_ALLOWANCE ))
-readonly LOCAL_ARTIFACTS="${REPO_ROOT}/runs/${RUN_NAME}"
+# Overridable because REPO_ROOT can be a git worktree, which is deleted with
+# the session that made it. A run costs a GPU and hours; its artefacts should
+# be able to outlive the checkout that launched it.
+readonly LOCAL_ARTIFACTS="${MTG_RUNS_ROOT:-${REPO_ROOT}/runs}/${RUN_NAME}"
 readonly REMOTE_RUN_DIR="${REMOTE_ARTIFACTS}/${RUN_NAME}"
 
 # --------------------------------------------------------------------------
@@ -375,8 +437,7 @@ build_remote_script() {
     # at its origin/main default. Otherwise a push landing between preflight
     # and clone would train a commit this script never checked.
     local -a bootstrap_argv=(
-        --sets "$SET_NAME"
-        --train-set "$SET_NAME"
+        --sets "${STAGE_SETS[@]}"
         --ref "$GIT_COMMIT"
         --arm "$ARM"
         --width "$WIDTH"
@@ -386,6 +447,12 @@ build_remote_script() {
         --artefact-root "$REMOTE_ARTIFACTS"
         --max-seconds "$MAX_SECONDS"
     )
+    if [[ -n "$HELD_OUT" ]]; then
+        bootstrap_argv+=(--held-out "$HELD_OUT")
+    else
+        bootstrap_argv+=(--train-set "$SET_NAME")
+    fi
+    [[ "$UPLOAD_PROCESSED" == "1" ]] && bootstrap_argv+=(--cache-dir "$REMOTE_CACHE")
     [[ -n "$EPOCHS" ]] && bootstrap_argv+=(--epochs "$EPOCHS")
     [[ -n "$DATA_FRACTION" ]] && bootstrap_argv+=(--data-fraction "$DATA_FRACTION")
     [[ -n "$NEURON_MULTIPLIER" ]] && bootstrap_argv+=(--neuron-multiplier "$NEURON_MULTIPLIER")
@@ -538,19 +605,85 @@ for f in d.get("files", []):
 }
 
 # --------------------------------------------------------------------------
+# Staging by upload
+# --------------------------------------------------------------------------
+#
+# The bootstrap's default path downloads each set's ~200MB raw export from S3
+# and ingests it, ~283s a set. That is a reasonable default for one set and a
+# bad one for nine: three quarters of an hour of VM time, repeated every
+# session, to reproduce arrays that already exist on this machine.
+#
+# Uploading them instead costs one transfer of ~550MB and has a second
+# advantage that matters more than the time: the VM then trains on the exact
+# arrays the local tests validated, rather than on the output of a second
+# ingest that is only supposed to be identical.
+#
+# The files land in a cache directory rather than in the checkout, because the
+# checkout does not exist yet -- the clone happens inside the first exec. The
+# bootstrap's existing --cache-dir restore path picks them up from there.
+
+PROCESSED_FILES=(picks.npz vocab.json card_features.npz ingest_stats.json)
+
+upload_processed() {
+    local total=$(( ${#STAGE_SETS[@]} * ${#PROCESSED_FILES[@]} ))
+    local done_count=0 started
+    started=$(date +%s)
+
+    # `colab upload` writes one file and is not documented to create parents,
+    # so the directories are made first.
+    local mk="${TMPDIR_RUN}/mkdirs.py"
+    {
+        echo "import os"
+        for s in "${STAGE_SETS[@]}"; do
+            printf "os.makedirs(%q, exist_ok=True)\n" "${REMOTE_CACHE}/${s}.PremierDraft"
+        done
+        echo "print('cache dirs ready')"
+    } > "$mk"
+    colab_cmd exec -s "$SESSION" -f "$mk" --timeout 120 \
+        || die "could not create ${REMOTE_CACHE} on the VM"
+
+    log "uploading ${total} files for ${#STAGE_SETS[@]} set(s) into ${REMOTE_CACHE}..."
+    for s in "${STAGE_SETS[@]}"; do
+        for f in "${PROCESSED_FILES[@]}"; do
+            local src="${REPO_ROOT}/data/processed/${s}.PremierDraft/${f}"
+            [[ -f "$src" ]] || die "missing ${src}.
+--upload-processed needs every set ingested locally first:
+  python -m src.data.ingest --csv data/raw/draft_data_public.${s}.PremierDraft.csv.gz --out data/processed/${s}.PremierDraft"
+            colab_cmd upload -s "$SESSION" "$src" \
+                "${REMOTE_CACHE}/${s}.PremierDraft/${f}" \
+                || die "upload of ${s}/${f} failed"
+            done_count=$(( done_count + 1 ))
+        done
+        log "  ${s} staged (${done_count}/${total} files, $(( $(date +%s) - started ))s)"
+    done
+    log "upload finished in $(( $(date +%s) - started ))s"
+}
+
+# --------------------------------------------------------------------------
 # Provision and run
 # --------------------------------------------------------------------------
 
-log "provisioning ${accel_desc} as session '${SESSION}'..."
-new_args=(new -s "$SESSION")
-[[ -n "$GPU" ]] && new_args+=(--gpu "$GPU")
-[[ -n "$TPU" ]] && new_args+=(--tpu "$TPU")
-colab_cmd "${new_args[@]}" || die "could not provision ${accel_desc}.
+if [[ "$REUSE_SESSION" == "1" ]] && colab_cmd status -s "$SESSION" >/dev/null 2>&1; then
+    log "reusing the running session '${SESSION}' -- its staged data and
+[driver] earlier artefacts are gitignored, so the checkout to this commit keeps them"
+    # Still ours to release: cleanup stops it unless --keep says otherwise.
+    PROVISIONED=1
+else
+    log "provisioning ${accel_desc} as session '${SESSION}'..."
+    new_args=(new -s "$SESSION")
+    [[ -n "$GPU" ]] && new_args+=(--gpu "$GPU")
+    [[ -n "$TPU" ]] && new_args+=(--tpu "$TPU")
+    colab_cmd "${new_args[@]}" || die "could not provision ${accel_desc}.
 A 400 here usually means the account has no entitlement for this accelerator
 on its current tier. Fall back to --gpu T4, or omit the flag for CPU."
-PROVISIONED=1
+    PROVISIONED=1
+fi
 
 colab_cmd status -s "$SESSION" || true
+
+# Before the first exec, so the bootstrap's staging step finds the cache
+# already warm rather than downloading and ingesting into it.
+[[ "$UPLOAD_PROCESSED" == "1" ]] && upload_processed
 
 segment=0
 resume=0

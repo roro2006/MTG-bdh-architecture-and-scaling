@@ -25,17 +25,30 @@ FEATURE_DIM = 65
 # One name carries a comma, as real cards do ("Zidane, Tantalus Thief").
 CARDS = sorted([f"Card {i:02d}" for i in range(20)] + ["Zidane, Tantalus Thief"])
 
-COLUMNS = (
-    ["expansion", "event_type", "draft_id", "draft_time", "rank",
-     "event_match_wins", "event_match_losses", "pack_number", "pick_number",
-     "pick", "pick_maindeck_rate", "pick_sideboard_in_rate"]
-    + [f"pack_card_{c}" for c in CARDS]
-    + [f"pool_{c}" for c in CARDS]
-    + ["user_n_games_bucket", "user_game_win_rate_bucket"]
-)
+def columns_for(cards) -> list[str]:
+    """The export header for a given card pool.
+
+    A parameter rather than a constant because a multi-set corpus is built
+    from exports that do *not* share a card pool -- that is the whole point
+    of the shared card index in src/data/multiset.py, and a test that can
+    only emit one pool cannot exercise it.
+    """
+    return (
+        ["expansion", "event_type", "draft_id", "draft_time", "rank",
+         "event_match_wins", "event_match_losses", "pack_number", "pick_number",
+         "pick", "pick_maindeck_rate", "pick_sideboard_in_rate"]
+        + [f"pack_card_{c}" for c in cards]
+        + [f"pool_{c}" for c in cards]
+        + ["user_n_games_bucket", "user_game_win_rate_bucket"]
+    )
 
 
-def write_export(path, drafts, gzipped: bool = True, drop_columns=()) -> None:
+COLUMNS = columns_for(CARDS)
+
+
+def write_export(
+    path, drafts, gzipped: bool = True, drop_columns=(), cards=None, expansion="TST"
+) -> None:
     """Writes a format-faithful draft_data_public CSV.
 
     `drafts` is a list of (draft_id, packs), where packs holds
@@ -45,8 +58,10 @@ def write_export(path, drafts, gzipped: bool = True, drop_columns=()) -> None:
     disagree about which ones they carry: AFR.PremierDraft has no `rank`
     and no `user_game_win_rate_bucket` at all.
     """
+    cards = list(CARDS if cards is None else cards)
+    columns = columns_for(cards)
     drop = set(drop_columns)
-    keep = [i for i, c in enumerate(COLUMNS) if c not in drop]
+    keep = [i for i, c in enumerate(columns) if c not in drop]
 
     opener = gzip.open if gzipped else open
     with opener(path, "wt", encoding="utf-8", newline="") as handle:
@@ -57,23 +72,24 @@ def write_export(path, drafts, gzipped: bool = True, drop_columns=()) -> None:
                 raw.writerow(row if not drop else [row[i] for i in keep])
 
         writer = _RowWriter()
-        writer.writerow(COLUMNS)
+        writer.writerow(columns)
         for draft_id, packs in drafts:
             pool: list[str] = []
             for pack_number, taken in enumerate(packs):
                 for pick_number in range(len(taken)):
-                    pack_counts = {c: 0 for c in CARDS}
+                    pack_counts = {c: 0 for c in cards}
                     for card in taken[pick_number:]:
                         pack_counts[card] += 1
-                    pool_counts = {c: 0 for c in CARDS}
+                    pool_counts = {c: 0 for c in cards}
                     for card in pool:
                         pool_counts[card] += 1
                     writer.writerow(
-                        ["TST", "PremierDraft", draft_id, "2025-01-01 00:00:00",
+                        [expansion, "PremierDraft", draft_id,
+                         "2025-01-01 00:00:00",
                          "gold", 3, 2, pack_number, pick_number,
                          taken[pick_number], 1.0, 0.0]
-                        + [pack_counts[c] for c in CARDS]
-                        + [pool_counts[c] for c in CARDS]
+                        + [pack_counts[c] for c in cards]
+                        + [pool_counts[c] for c in cards]
                         + [3, 0.55]
                     )
                     pool.append(taken[pick_number])
@@ -84,6 +100,7 @@ def make_draft(
     draft_id: str,
     picks_per_pack: int = PICKS_PER_PACK,
     packs_per_draft: int = PACKS_PER_DRAFT,
+    cards=None,
 ):
     """One well-formed draft: `packs_per_draft` packs of distinct cards.
 
@@ -92,8 +109,9 @@ def make_draft(
     -- see src/data/ingest.py::PackGeometry. A test that can only build
     3x14 exports cannot tell a working detector from a hardcoded 14.
     """
+    pool = CARDS if cards is None else list(cards)
     packs = [
-        list(rng.choice(CARDS, size=picks_per_pack, replace=False))
+        list(rng.choice(pool, size=picks_per_pack, replace=False))
         for _ in range(packs_per_draft)
     ]
     return (draft_id, packs)
@@ -105,9 +123,10 @@ def make_drafts(
     prefix: str = "draft",
     picks_per_pack: int = PICKS_PER_PACK,
     packs_per_draft: int = PACKS_PER_DRAFT,
+    cards=None,
 ):
     return [
-        make_draft(rng, f"{prefix}{i:04d}", picks_per_pack, packs_per_draft)
+        make_draft(rng, f"{prefix}{i:04d}", picks_per_pack, packs_per_draft, cards)
         for i in range(count)
     ]
 

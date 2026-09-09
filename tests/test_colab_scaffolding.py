@@ -253,5 +253,144 @@ def test_the_driver_forwards_the_grid_flags_and_names_by_them():
             "report the flag in its plan"
         )
 
-    # The default name has to branch on how the cell was sized.
-    assert 'RUN_NAME="${ARM}_d${WIDTH}_e${EPOCHS}"' in source
+    # The default name has to branch on how the cell was sized. The prefix is
+    # the same rule applied to a second axis: a zero-shot transfer cell and a
+    # same-set cell of identical arm/width/size are different experiments, and
+    # sharing a name would land them in one artefact directory with the second
+    # resuming the first's state.
+    assert 'RUN_NAME="${prefix}${ARM}_d${WIDTH}_e${EPOCHS}"' in source
+    assert 'RUN_NAME="${prefix}${ARM}_d${WIDTH}_s${STEPS}"' in source
+    assert '[[ -n "$HELD_OUT" ]] && prefix="transfer_"' in source
+
+
+# --------------------------------------------------------------------------
+# The zero-shot cross-set path
+# --------------------------------------------------------------------------
+#
+# A transfer cell reaches the VM through the same two files as a grid cell,
+# but points them at a different entry point and at nine corpora instead of
+# one. The failure modes are the ones the tests above already care about,
+# arriving by a new road: an entry point that trains the wrong thing, and a
+# run name that collides with a same-set cell and resumes its state.
+
+
+def _transfer_args(module, extra=()):
+    base = ["--sets", "BLB", "DSK", "FIN", "--held-out", "FIN"]
+    return module["parse_args"](base + list(extra))
+
+
+def test_held_out_routes_to_the_transfer_entry_point():
+    """--held-out has to change the module, not just add a flag.
+
+    Passing it to run.py would train a single-set cell and report it under a
+    transfer run name -- a number that looks like the headline and is not.
+    """
+    module = _load_bootstrap_without_running_it()
+    argv = module["build_training_argv"](
+        _transfer_args(module), Path("/repo/data/processed/FIN.PremierDraft"),
+        Path("/out"),
+    )
+
+    assert argv[:3] == [argv[0], "-m", "src.training.transfer"]
+    assert "src.training.run" not in argv
+    # transfer.py takes the root holding every set, not one set's directory.
+    assert argv[argv.index("--processed-root") + 1] == "/repo/data/processed"
+    assert argv[argv.index("--held-out") + 1] == "FIN"
+
+
+def test_the_held_out_set_is_never_also_a_training_set():
+    """The one assertion the whole experiment rests on, at the argv layer."""
+    module = _load_bootstrap_without_running_it()
+    argv = module["build_training_argv"](
+        _transfer_args(module), Path("/repo/data/processed/FIN.PremierDraft"),
+        Path("/out"),
+    )
+
+    start = argv.index("--train-sets") + 1
+    train_sets = []
+    for token in argv[start:]:
+        if token.startswith("--"):
+            break
+        train_sets.append(token)
+    assert train_sets == ["BLB", "DSK"]
+    assert "FIN" not in train_sets
+
+
+def test_without_held_out_nothing_changes():
+    """The grid's path through the bootstrap must be untouched."""
+    module = _load_bootstrap_without_running_it()
+    args = module["parse_args"](["--sets", "FIN", "--train-set", "FIN"])
+    argv = module["build_training_argv"](
+        args, Path("/repo/data/processed/FIN.PremierDraft"), Path("/out")
+    )
+
+    assert argv[:3] == [argv[0], "-m", "src.training.run"]
+    assert "--held-out" not in argv
+    assert "--processed-root" not in argv
+    assert argv[argv.index("--processed-dir") + 1] == "/repo/data/processed/FIN.PremierDraft"
+
+
+def test_transfer_and_same_set_cells_cannot_share_a_run_name():
+    module = _load_bootstrap_without_running_it()
+    same_set = module["parse_args"](["--sets", "FIN", "--train-set", "FIN"])
+    transfer = _transfer_args(module)
+
+    assert module["default_run_name"](same_set, "FIN") != module[
+        "default_run_name"
+    ](transfer, "FIN")
+    assert module["default_run_name"](transfer, "FIN").startswith("transfer_")
+
+
+def test_driver_forwards_the_transfer_flags():
+    source = DRIVER.read_text(encoding="utf-8")
+
+    for flag in ("--sets", "--held-out", "--upload-processed", "--remote-cache"):
+        assert f"{flag})" in source, f"the driver does not accept {flag}"
+    # --held-out and --train-set are mutually exclusive on the far side: one
+    # says "train on everything but this", the other "train on exactly this".
+    assert 'bootstrap_argv+=(--held-out "$HELD_OUT")' in source
+    assert 'bootstrap_argv+=(--train-set "$SET_NAME")' in source
+    # Uploading is pointless unless the bootstrap is told to look there.
+    assert 'bootstrap_argv+=(--cache-dir "$REMOTE_CACHE")' in source
+
+
+def test_upload_covers_every_file_the_loader_needs():
+    """A partial upload stages a directory that `is_staged` calls complete."""
+    driver = DRIVER.read_text(encoding="utf-8")
+    markers = _literal(BOOTSTRAP, "PROCESSED_MARKERS")
+
+    match = re.search(r"PROCESSED_FILES=\(([^)]*)\)", driver)
+    assert match, "the driver defines no PROCESSED_FILES"
+    uploaded = set(match.group(1).split())
+
+    assert set(markers) <= uploaded, (
+        f"the driver uploads {sorted(uploaded)} but the bootstrap's "
+        f"is_staged() checks for {sorted(markers)}; a set would be judged "
+        "staged with a file missing"
+    )
+    # ingest_stats.json is not a marker but carries the pack geometry, and a
+    # corpus loaded without it falls back to inferring one.
+    assert "ingest_stats.json" in uploaded
+
+
+def test_reused_sessions_are_still_released():
+    """--reuse-session must not leak the teardown.
+
+    `cleanup` only stops what it believes the run provisioned. If attaching
+    to a running session left PROVISIONED at 0, the last cell of a series
+    would exit without stopping the VM and it would bill to the 24h
+    keep-alive cap with nobody watching -- the third failure mode this
+    driver's header names.
+    """
+    source = DRIVER.read_text(encoding="utf-8")
+
+    start = source.index('if [[ "$REUSE_SESSION" == "1" ]]')
+    end = source.index("segment=0", start)
+    branch = source[start:end]
+
+    # Both arms of the provision-or-attach choice claim the session.
+    assert branch.count("PROVISIONED=1") == 2, (
+        "one path through provisioning does not mark the session as ours to "
+        "stop; cleanup would leave it running"
+    )
+    assert "--reuse-session)" in source
