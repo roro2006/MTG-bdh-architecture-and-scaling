@@ -6,11 +6,16 @@ questions and not others, and the split matters:
 - **Answered.** Whether the harness produces a real drafter (yes), whether
   it uses its pool (yes, heavily), whether it learned card interaction
   rather than colour-matching (yes, about half the pool effect is genuinely
-  pairwise), and what the binding constraint on quality is at this width
-  (capacity, not steps).
+  pairwise), what the binding constraint on quality is at this width
+  (capacity, not steps), and whether a model trained on other sets can draft
+  a set it has never seen (yes — it beats a card-quality prior fitted on the
+  held-out set's own drafts, while recovering 44% of the loss gap to the
+  same-set ceiling).
 - **Not answered.** Whether BDH or cross-attention is the better arm.
   Nothing below separates them, and one seed per arm at one width could not
-  have. `PROJECT_PLAN.md` §6's grid is what settles it.
+  have. `PROJECT_PLAN.md` §6's grid is what settles it. The zero-shot
+  comparison is one-armed for the same reason: only cross-attention has been
+  run held-out.
 
 **A boundary that makes older numbers unreadable.** The feature table was
 rebuilt from 65 columns to 119 (15 global keywords + 73 mechanics). Loss is
@@ -74,6 +79,126 @@ directly that it does.
 which is the opposite of what the fused-kernel work is meant to address and
 worth remembering before reading a per-step cost off this table.
 `ARCHITECTURE.md` predicts this shape at iso-parameter sizing.
+
+## Zero-shot: drafting a set the model has never seen
+
+The project's central claim, and until now the only headline with no number
+behind it. `CardEmbedding` is an MLP over a card's attributes rather than a
+per-card lookup, and `PointerHead` scores pack slots rather than vocabulary
+entries, so nothing in `PickModel` is indexed by card id. A model trained on
+other sets can score a new set's cards with **no new parameters at all**. The
+question is whether it can do so *well*.
+
+**Protocol.** Train on eight sets — `BLB DSK EOE HBG LCI MH3 OTJ SIR`,
+30,006,788 decision rows — and evaluate on `FIN`, held out entirely. 92,000
+steps at batch 512, $d=64$, seed 0: the same optimiser, schedule and step
+count as [the converged comparison](#the-converged-comparison) above, so the
+only difference between the two numbers is which drafts produced the
+gradient. Splits are drawn per set before concatenation, so this is measured
+on the **identical 589,008 val rows** the same-set run used.
+
+It is eight sets rather than nine because `AFR` cannot be a training set —
+its export omits every draft's first pick, so every pool reconstructed from
+it is short one card (`DATA.md`). The transfer model carries 263,809
+parameters against the same-set model's 263,745: the corpus envelope is 3×15
+rather than FIN's 3×14, which adds one row to the pick-number embedding.
+0.02% more parameters.
+
+**The held-out set is unseen; not all of its cards are.** Eight of FIN's 363
+cards are also printed in a training set — five basic lands plus *Ancient
+Copper Dragon*, *Deadly Dispute* and *K'rrik, Son of Yawgmoth*. **2.2%.**
+Whatever the model knows about the other 97.8% it inferred from attributes.
+
+### The numbers
+
+Picks 0–8, the decision slice, on the FIN val split:
+
+| | loss | accuracy |
+|---|---|---|
+| uniform | 2.2671 | — |
+| transferred pick-rate prior | 2.2302 | 0.0946 |
+| **zero-shot model** | **1.6916** | **0.4023** |
+| same-set pick-rate prior | 1.9474 | 0.3630 |
+| same-set model | 1.0033 | 0.6239 |
+
+All picks: **1.3306 / 0.5097**, against the same-set model's 0.8212 / 0.6834.
+
+The two priors are the floor and a reference point, and they are different
+questions. The *transferred* prior scores every card by how often it is taken
+in the eight training sets and applies that to FIN — the honest zero-shot
+floor, and nearly useless at 9.5% accuracy, precisely because 97.8% of FIN's
+cards never appear in it. The *same-set* prior is fitted on FIN's own 4.7M
+training picks and is not available to the model at all.
+
+**Transfer is real.** 0.54 nats and 30.8 accuracy points clear of the
+transferred prior. With the prior at barely-above-chance, essentially all of
+the model's skill on FIN comes from reading card attributes.
+
+**It beats a baseline it has no right to beat.** 1.6916 against the same-set
+prior's 1.9474, and 40.2% against 36.3% — a card-quality table computed from
+FIN drafts the model never saw.
+
+**And it is a long way from the ceiling.** 0.69 nats and 22.2 points short of
+the same-set model. On a floor-to-ceiling scale it recovers 44% of the loss
+gap and 58% of the accuracy gap. Transfer works; it is not free.
+
+### What transfers, and what does not
+
+Normalising each pick by its own uniform-guess loss removes the pack-size
+confound and leaves the model's edge in nats. The zero-shot edge as a
+*fraction* of the same-set edge:
+
+| pick | pack | same-set edge | zero-shot edge | ratio |
+|---|---:|---:|---:|---:|
+| 0 | 14 | 1.6324 | 0.7740 | 0.47 |
+| 1 | 13 | 1.4721 | 0.5929 | **0.40** |
+| 2 | 12 | 1.4073 | 0.5796 | 0.41 |
+| 4 | 10 | 1.2798 | 0.5843 | 0.46 |
+| 6 | 8 | 1.1166 | 0.5318 | 0.48 |
+| 8 | 6 | 0.9029 | 0.4735 | 0.52 |
+| 10 | 4 | 0.6583 | 0.3808 | 0.58 |
+| 12 | 2 | 0.3592 | 0.2614 | **0.73** |
+
+Monotonic from 0.40 to 0.73. **The transfer gap is widest where the decision
+is hardest.** Broad card-quality judgment crosses sets; the fine
+discrimination that matters when a pack is still full of live options does
+not. A drafter that has never seen the set is at its most human-like when the
+pack is nearly empty and its choices are nearly forced.
+
+The dip at pick 1 — the first pick with a non-empty pool, where the ratio
+falls from 0.47 to 0.40 — is consistent with pool-conditioned reasoning
+transferring worse than raw card evaluation. It is one point on one run and is
+recorded as suggestive, not established.
+
+### Held-out performance saturates early
+
+| | best val | at step | of budget |
+|---|---|---|---|
+| same-set FIN | 0.8211 | 88,250 | **96%** |
+| zero-shot | 1.3074 | 52,250 | **57%** |
+
+The same-set run was still setting new bests at 96% of its budget. This one
+peaked at 57% and then went 39,750 steps without improving (final 1.3264),
+through the whole cosine decay. Anyone sizing a transfer run should not assume
+the same-set step count carries over.
+
+Note this run made 1.57 passes over 30M rows where the same-set run made ten
+over 4.7M, so it was still seeing fresh data when it stopped improving. The
+saturation is not data exhaustion.
+
+### What this result is not
+
+One seed, one width, one held-out set, **and one arm** — only cross-attention
+was run. The BDH arm of this comparison is outstanding, so nothing here says
+anything about which architecture transfers better.
+
+**Provenance.** The Colab session was pruned during teardown before the driver
+could download `metrics.json`. Every number above comes from the run's own
+stdout, preserved in `runs/colab_transfer_attention.log`, and the file was
+rebuilt from it — `metrics.json` carries `reconstructed_from_log: true`.
+`params.msgpack` is the genuine best-val checkpoint, mirrored at the end of
+segment 1. The run executed at commit `0e72cd8`, whose content-identical
+successor after a history rewrite is `bbb53dc`.
 
 ## Ten epochs is past the point of return
 
