@@ -394,3 +394,109 @@ def test_reused_sessions_are_still_released():
         "stop; cleanup would leave it running"
     )
     assert "--reuse-session)" in source
+
+
+# --------------------------------------------------------------------------
+# Artefact retrieval must not hang off one small file
+# --------------------------------------------------------------------------
+#
+# Twice a run finished on the VM, wrote every artefact, printed its own
+# "wrote ..." line -- and the driver lost all of it, because the single
+# download of STATUS.json failed, which it read as a dead segment. It then
+# re-execed and the session was pruned underneath it. Both runs had to be
+# reconstructed from their logs.
+#
+# The three properties below are what stop that recurring. They are asserted
+# against the source because the functions cannot be executed here: the driver
+# runs preflight at load and shells out to the Colab CLI.
+
+
+def _driver_function(name: str) -> str:
+    """The body of one shell function, for asserting on in isolation."""
+    source = DRIVER.read_text(encoding="utf-8")
+    start = source.index(f"{name}() {{")
+    return source[start:source.index("\n}", start)]
+
+
+def test_artefact_names_cover_everything_a_run_can_leave():
+    """The speculative half of retrieval is only as good as this list.
+
+    It is the fallback used when STATUS.json's manifest is unavailable, so a
+    filename added to the bootstrap or to checkpoint.py and not added here
+    would be silently unretrievable in exactly the situation the fallback
+    exists for.
+    """
+    source = DRIVER.read_text(encoding="utf-8")
+    match = re.search(r"ARTEFACT_NAMES=\(([^)]*)\)", source)
+    assert match, "the driver defines no ARTEFACT_NAMES"
+    names = set(match.group(1).split())
+
+    from src.training.checkpoint import METADATA_FILE, PARAMS_FILE
+
+    required = {
+        PARAMS_FILE, METADATA_FILE,
+        RESUME_PARAMS_FILE, RESUME_STATE_FILE,
+        "metrics.json",    # run.py / transfer.py, written only on completion
+        "progress.json",   # ... and only when incomplete
+    }
+    missing = sorted(required - names)
+    assert not missing, (
+        f"ARTEFACT_NAMES omits {missing}; those would be unretrievable whenever "
+        "STATUS.json cannot be fetched, which is the case it exists for"
+    )
+
+
+def test_status_is_retried_before_it_is_believed():
+    """One transient download failure must not cost a segment.
+
+    Asserting merely that a loop exists is not enough -- `for attempt in 1`
+    is a loop and retries nothing. The count is the property.
+    """
+    body = _driver_function("fetch_status")
+    match = re.search(r"for attempt in ([\d ]+); do", body)
+    assert match, "fetch_status does not loop over attempts"
+    attempts = match.group(1).split()
+    assert len(attempts) >= 3, (
+        f"fetch_status makes only {len(attempts)} attempt(s); one transient "
+        "failure would still cost the segment"
+    )
+    assert "sleep" in body, "fetch_status retries with no backoff"
+
+
+def test_retrieval_does_not_depend_on_the_manifest():
+    """pull_artifacts must ask for the known names too, not only the manifest."""
+    body = _driver_function("pull_artifacts")
+    assert 'ARTEFACT_NAMES[@]' in body, (
+        "pull_artifacts uses only STATUS.json's manifest, so a failed "
+        "STATUS.json download still discards the whole segment"
+    )
+
+
+def test_a_missing_status_still_retrieves_and_can_still_complete():
+    """The branch that lost two runs.
+
+    Without a STATUS.json the driver must pull first and judge afterwards,
+    and must accept a completed metrics.json as proof the run finished --
+    rather than re-execing into a session that is about to be pruned.
+    """
+    source = DRIVER.read_text(encoding="utf-8")
+    start = source.index("produced no readable STATUS.json")
+    branch = source[start:source.index("resume=1", start)]
+
+    assert "pull_artifacts" in branch, "the no-STATUS branch retrieves nothing"
+    assert "metrics_says_complete" in branch, (
+        "the no-STATUS branch cannot recognise a finished run"
+    )
+    # Retrieval has to happen before the failure verdict, or a failed exec
+    # still throws away artefacts that were sitting on the VM.
+    assert branch.index("pull_artifacts") < branch.index('"$rc" != "0"'), (
+        "the driver decides the segment failed before trying to retrieve"
+    )
+
+
+def test_completion_is_judged_on_completed_not_on_the_file_existing():
+    """progress.json and metrics.json can both be present after a resume."""
+    body = _driver_function("metrics_says_complete")
+    assert '"completed"' in body, (
+        "metrics_says_complete treats any metrics.json as a finished run"
+    )
