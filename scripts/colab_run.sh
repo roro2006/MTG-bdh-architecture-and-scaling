@@ -549,15 +549,65 @@ fi
 
 STATUS_LOCAL="${TMPDIR_RUN}/STATUS.json"
 
+# What a finished or interrupted run directory can hold, as the bootstrap and
+# checkpoint.py name them. This exists so retrieval does not *depend* on
+# STATUS.json: a download of a file that is not there fails harmlessly, so
+# asking for all of them costs a few wasted calls and buys independence from
+# the one small file that has twice been the single point of failure.
+# tests/test_colab_scaffolding.py keeps this list honest against both.
+ARTEFACT_NAMES=(
+    metrics.json
+    params.msgpack
+    metadata.json
+    progress.json
+    resume.json
+    resume.msgpack
+)
+
 # Returns 0 if a STATUS.json came back. The bootstrap writes it last, so its
-# absence means the segment died before finishing -- which is a normal thing
-# to survive, not a reason to wedge the loop.
+# absence *usually* means the segment died before finishing -- but not always,
+# and that distinction cost two complete runs. Twice the bootstrap finished,
+# wrote every artefact, and printed its own "wrote ..." line, and the single
+# download of this file still failed; the driver then read that as a dead
+# segment, re-execed, and lost the VM (and with it the results) to teardown.
+#
+# So a miss is retried before it is believed. It is one small file and the
+# whole segment's output hangs off it.
 fetch_status() {
-    rm -f "$STATUS_LOCAL"
-    colab_cmd download -s "$SESSION" "${REMOTE_RUN_DIR}/STATUS.json" "$STATUS_LOCAL" \
-        >/dev/null 2>&1 || return 1
-    [[ -s "$STATUS_LOCAL" ]] || return 1
-    python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$STATUS_LOCAL" 2>/dev/null || return 1
+    local attempt
+    for attempt in 1 2 3; do
+        rm -f "$STATUS_LOCAL"
+        if colab_cmd download -s "$SESSION" "${REMOTE_RUN_DIR}/STATUS.json" \
+               "$STATUS_LOCAL" >/dev/null 2>&1 \
+           && [[ -s "$STATUS_LOCAL" ]] \
+           && python3 -c 'import json,sys; json.load(open(sys.argv[1]))' \
+                  "$STATUS_LOCAL" 2>/dev/null; then
+            [[ "$attempt" -gt 1 ]] && log "STATUS.json arrived on attempt ${attempt}"
+            return 0
+        fi
+        [[ "$attempt" -lt 3 ]] && sleep $(( attempt * 3 ))
+    done
+    return 1
+}
+
+# True when the artefacts already on disk show a finished run.
+#
+# run.py and transfer.py write metrics.json only on completion, and unlink
+# progress.json when they do, so a parseable metrics.json with completed=true
+# is a completion signal in its own right -- one that does not need the
+# session to still be reachable. This is the check that would have let both
+# lost runs finish cleanly instead of being re-execed into a pruned VM.
+metrics_says_complete() {
+    local f="${LOCAL_ARTIFACTS}/metrics.json"
+    [[ -s "$f" ]] || return 1
+    python3 -c '
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(1)
+sys.exit(0 if d.get("completed") is True else 1)
+' "$f" 2>/dev/null
 }
 
 status_field() {
@@ -572,22 +622,42 @@ print("" if v is None else v)
 ' "$STATUS_LOCAL" "$1" 2>/dev/null || true
 }
 
-# colab download moves one file per call, so the manifest in STATUS.json is
-# what makes retrieval possible at all -- there is no recursive get.
+# `colab download` moves one file per call and there is no recursive get, so
+# retrieval needs a list of names. STATUS.json carries an exact manifest --
+# but it is the least reliable thing in the directory to fetch, and gating
+# retrieval on it means one failed download of one small file discards a whole
+# segment's work. That is exactly how two finished runs were lost.
+#
+# So the manifest is used when it is there and is not required: the names
+# tried are the union of the manifest and ARTEFACT_NAMES. A file that does not
+# exist simply fails to download, which costs a call and nothing else, so the
+# speculative half is silent about misses while a manifest entry that fails is
+# still reported.
 pull_artifacts() {
     mkdir -p "$LOCAL_ARTIFACTS"
     cp -f "$STATUS_LOCAL" "${LOCAL_ARTIFACTS}/STATUS.json" 2>/dev/null || true
 
-    local files pulled=0 failed=0
-    files="$(python3 -c '
+    local manifest=""
+    if [[ -s "$STATUS_LOCAL" ]]; then
+        manifest="$(python3 -c '
 import json, sys
-d = json.load(open(sys.argv[1]))
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
 for f in d.get("files", []):
     if isinstance(f, str) and f.strip():
-        print(f)
+        print(f.strip())
 ' "$STATUS_LOCAL" 2>/dev/null || true)"
+    fi
 
-    [[ -n "$files" ]] || { log "STATUS.json lists no artefacts yet"; return 0; }
+    local wanted pulled=0 failed=0 speculative=0
+    wanted="$(
+        {
+            [[ -n "$manifest" ]] && printf '%s\n' "$manifest"
+            printf '%s\n' "${ARTEFACT_NAMES[@]}"
+        } | awk 'NF && !seen[$0]++'
+    )"
 
     while IFS= read -r rel; do
         [[ -n "$rel" ]] || continue
@@ -595,13 +665,19 @@ for f in d.get("files", []):
         if colab_cmd download -s "$SESSION" "${REMOTE_RUN_DIR}/${rel}" \
                "${LOCAL_ARTIFACTS}/${rel}" >/dev/null 2>&1; then
             pulled=$(( pulled + 1 ))
-        else
+        elif grep -qxF "$rel" <<< "$manifest"; then
             failed=$(( failed + 1 ))
-            warn "could not download ${rel}"
+            warn "could not download ${rel}, which STATUS.json lists"
+        else
+            speculative=$(( speculative + 1 ))
         fi
-    done <<< "$files"
+    done <<< "$wanted"
 
-    log "pulled ${pulled} artefact(s) into ${LOCAL_ARTIFACTS}$([[ $failed -gt 0 ]] && printf ' (%d failed)' "$failed")"
+    log "pulled ${pulled} artefact(s) into ${LOCAL_ARTIFACTS}$(
+        [[ $failed -gt 0 ]] && printf ' (%d listed but missing)' "$failed"
+    )$(
+        [[ -z "$manifest" ]] && printf ' (no manifest; asked for the known names)'
+    )"
 }
 
 # --------------------------------------------------------------------------
@@ -736,14 +812,29 @@ Session log: $COLAB_BIN --config $STATE_FILE log -s ${SESSION}
 Artefacts so far are in ${LOCAL_ARTIFACTS}."
         fi
     else
-        # No STATUS.json. If exec itself also failed, this is a real error;
-        # there is nothing to resume from and nothing to retrieve.
+        # No STATUS.json -- which does NOT mean no artefacts. Retrieve first
+        # and decide afterwards: the alternative, believing the missing file
+        # and re-execing, is what destroyed two completed runs. Pulling costs
+        # a handful of downloads against a VM that is still up.
+        warn "segment ${segment} produced no readable STATUS.json; retrieving anyway"
+        pull_artifacts
+
+        if metrics_says_complete; then
+            log "metrics.json says the run completed; taking that over the missing STATUS.json"
+            completed=1
+            final_rc=0
+            break
+        fi
+
+        # Only now is a failed exec a real error, and only now with nothing
+        # worth keeping behind it.
         if [[ "$rc" != "0" ]]; then
             final_rc="$rc"
-            die "segment ${segment} failed (exec exit ${rc}) and wrote no STATUS.json.
+            die "segment ${segment} failed (exec exit ${rc}), wrote no STATUS.json,
+and left no completed metrics.json. Anything retrievable is in ${LOCAL_ARTIFACTS}.
 Inspect the session: $COLAB_BIN --config $STATE_FILE log -s ${SESSION}"
         fi
-        warn "segment ${segment} produced no STATUS.json but exec succeeded; retrying with --resume"
+        warn "segment ${segment} is genuinely incomplete; retrying with --resume"
     fi
 
     resume=1
