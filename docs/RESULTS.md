@@ -11,13 +11,13 @@ questions and not others, and the split matters:
   a set it has never seen (yes — it beats a card-quality prior fitted on the
   held-out set's own drafts, while recovering 44% of the loss gap to the
   same-set ceiling).
-- **Partly answered.** Whether BDH or cross-attention is the better arm.
+- **Not answered.** Whether BDH or cross-attention is the better arm.
   In-distribution nothing separates them, at 0.0004 on the headline slice.
-  *Held out, BDH is ahead at every pick* by a weighted 0.0438 — the first
-  measurement here that distinguishes the arms at all, and it only appears
-  off-distribution. One seed each, so it wants a replication before it is
-  leaned on. `PROJECT_PLAN.md` §6's grid is still what settles the
-  in-distribution question.
+  Held out, BDH led by 0.0438 at seed 0 — but a seed replication moved one
+  arm by 0.0595, about twice that, so the lead is not separable from seed
+  noise and the claim is [retracted](#the-seed-replication-and-the-retraction).
+  `PROJECT_PLAN.md` §6's grid is still what settles it, and it now needs
+  more than one seed per cell to do so.
 
 **A boundary that makes older numbers unreadable.** The feature table was
 rebuilt from 65 columns to 119 (15 global keywords + 73 mechanics). Loss is
@@ -148,10 +148,12 @@ the same-set model. On a floor-to-ceiling scale BDH recovers 48% of the loss
 gap and 61% of the accuracy gap; attention 44% and 58%. Transfer works; it is
 not free.
 
-### The arms tie in-distribution and separate out of it
+### The arms tie in-distribution, and held out the difference is seed noise
 
-This is the first measurement in the project that distinguishes the two
-arms, and it only appears off-distribution.
+**This section previously claimed the arms separate off-distribution. A seed
+replication says they do not, and the claim is retracted below rather than
+edited away.** The per-pick evidence is kept because it is still the right
+way to look at the question — it was the inference from it that was wrong.
 
 Edge over uniform, per pick, as BDH minus attention. The same-set columns are
 the empirical null: same seed, same schedule, same evaluation code, two
@@ -176,21 +178,51 @@ architectures at 0.8% different parameter counts.
 
 In-distribution the differences are ±0.003 and the sign flips essentially at
 random — six positive, seven negative — which is what "the arms tie" looked
-like in the section above, now resolved per pick. Held out, **every one of
-the thirteen picks favours BDH**, by 0.017 to 0.057, an order of magnitude
-larger than the in-distribution spread.
+like in the section above, now resolved per pick. Held out, every one of the
+thirteen picks favours BDH, by 0.017 to 0.057.
 
-Two cautions on how far that goes. Thirteen picks of one run are not thirteen
-independent samples — they share a model, a seed and a training set — so the
-uniform sign is not a p-value. And the same-set columns bound the
-*evaluation* noise, not the *seed* noise: both arms were trained at seed 0,
-so this says the two architectures generalise differently at that seed, not
-that a different seed would preserve the ordering. A seed replication is the
-obvious next run, and it is cheap.
+That looked like a real architectural difference. It is not.
 
-What the result does not depend on is the evaluation being noisy or the slice
-being cherry-picked: these are exact losses over all 589,008 val rows, and
-the ordering holds on every slice reported here.
+#### The seed replication, and the retraction
+
+The section as first written flagged that the same-set columns bound
+*evaluation* noise and not *seed* noise, and called a replication the obvious
+next run. It was run: cross-attention again, everything identical except
+`--seed 1`, with `--split-seed` left at 0 so the val rows are the same ones.
+
+Comparing at matched steps — no best-val selection, nothing to distort it:
+
+| | mean gap over 9 matched steps |
+|---|---|
+| **seed** (attention, seed 0 vs seed 1) | **+0.0595** |
+| **arm** (attention vs BDH, both seed 0) | +0.0310 |
+
+**One arm moves about twice as much between seeds as the two arms differ from
+each other**, consistently at every one of the nine steps. The held-out arm
+difference is not separable from seed noise, and the claim that BDH transfers
+better is withdrawn.
+
+The exact full-split numbers appear to say the opposite — against seed 0's
+1.6916 on picks 0–8, seed 1 scores 1.7010, a spread of only 0.0094 against
+the arm's 0.0438. That comparison cannot be used. Seed 1's held-out curve
+never improved on its **step 2,000** value across the remaining 90,000 steps,
+so best-val selection returned a barely-trained checkpoint: its loss survives
+(an undertrained model is not badly calibrated) while its top-1 collapses by
+2.68 points (it is badly sharpened). Loss and accuracy disagreeing that way is
+the signature of the artefact, not of an architecture.
+
+Two things worth keeping from this beyond the retraction.
+
+**Best-val checkpointing assumes the val curve descends.** On a held-out curve
+that never improves, "best" is just the luckiest early sample — seed 1 selected
+step 2,000 of 92,000. Seed 0 hid this because its curve did descend. Any
+held-out run should report the final checkpoint alongside the best-val one.
+
+**Held-out variance is much larger than in-distribution variance.** The
+same-set arms agree to 0.0004 while held-out seeds of one arm differ by
+0.0595 — well over a hundred times more. Any future claim measured on a
+held-out set needs more than one seed before it means anything, and §6's grid
+should budget for that.
 
 ### What transfers, and what does not
 

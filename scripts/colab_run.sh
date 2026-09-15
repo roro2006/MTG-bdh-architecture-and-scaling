@@ -564,6 +564,58 @@ ARTEFACT_NAMES=(
     resume.msgpack
 )
 
+readonly DECODER="${REPO_ROOT}/scripts/decode_artifacts.py"
+
+# Recover artefacts from the exec output the bootstrap framed them into.
+#
+# This is the retrieval path that works. Downloading afterwards does not: the
+# VM stops being reachable at teardown, and two completed runs lost everything
+# that way -- zero files recovered, by any name, retries included. stdout has
+# already reached this machine by the time the session dies.
+#
+# Called after every exec, before anything consults the session, and safe to
+# repeat: the decoder verifies a SHA-256 per file and will not overwrite a good
+# file with a worse one.
+# Decodes into a per-segment directory first, then copies into LOCAL_ARTIFACTS.
+#
+# The staging directory is what makes the result attributable. LOCAL_ARTIFACTS
+# is `runs/<run name>`, which is deterministic and persists across segments and
+# across re-invocations -- so a STATUS.json sitting in it may belong to an
+# earlier segment or to a previous completed run. A segment that dies before
+# emitting anything would otherwise inherit that file and be read as finished
+# having done no work. Anything in DECODED_DIR came out of *this* segment's
+# output or is not there at all.
+decode_artifacts() {
+    local capture="$1" segment_no="${2:-0}"
+    DECODED_DIR="${TMPDIR_RUN}/decoded-${segment_no}"
+    rm -rf "$DECODED_DIR"
+    mkdir -p "$DECODED_DIR"
+
+    [[ -s "$capture" ]] || return 0
+    [[ -f "$DECODER" ]] || { warn "missing ${DECODER}"; return 0; }
+
+    local out status=0
+    out="$(python3 "$DECODER" "$capture" "$DECODED_DIR" 2>&1)" || status=$?
+
+    if [[ -n "$out" ]]; then
+        if (( status == 0 )); then
+            printf '[driver] %s\n' "$out" >&2
+        else
+            warn "artefact decoding reported problems:"
+            printf '[driver]   %s\n' "$out" >&2
+        fi
+    fi
+
+    mkdir -p "$LOCAL_ARTIFACTS"
+    # `find -exec cp` rather than a glob: an empty staging directory is the
+    # normal case for a segment that died early, and `cp dir/* ` would fail.
+    find "$DECODED_DIR" -maxdepth 1 -type f -exec cp -f {} "$LOCAL_ARTIFACTS/" \;
+
+    # Explicit success: this function is called as a bare statement under
+    # errexit, and the last command above must not decide the driver's fate.
+    return 0
+}
+
 # Returns 0 if a STATUS.json came back. The bootstrap writes it last, so its
 # absence *usually* means the segment died before finishing -- but not always,
 # and that distinction cost two complete runs. Twice the bootstrap finished,
@@ -587,6 +639,24 @@ fetch_status() {
         fi
         [[ "$attempt" -lt 3 ]] && sleep $(( attempt * 3 ))
     done
+
+    # The download failed -- which, at teardown, it always will. But
+    # decode_artifacts may already have recovered STATUS.json out of *this
+    # segment's* exec output, and a copy that arrived by stdout is exactly as
+    # authoritative as one that arrived by download.
+    #
+    # Read from the per-segment staging directory, never from LOCAL_ARTIFACTS:
+    # that persists across segments and across re-invocations, so a segment
+    # that died before emitting would otherwise pick up an earlier run's
+    # `completed: true` and report itself finished having done nothing.
+    local decoded="${DECODED_DIR:-}/STATUS.json"
+    if [[ -n "${DECODED_DIR:-}" && -s "$decoded" ]] \
+       && python3 -c 'import json,sys; json.load(open(sys.argv[1]))' \
+              "$decoded" 2>/dev/null; then
+        cp -f "$decoded" "$STATUS_LOCAL"
+        log "STATUS.json recovered from this segment's output rather than downloaded"
+        return 0
+    fi
     return 1
 }
 
@@ -774,8 +844,27 @@ while (( segment < MAX_SEGMENTS )); do
 
     log "segment ${segment}/${MAX_SEGMENTS}$([[ "$resume" == "1" ]] && printf ' (resuming)') -- exec timeout ${EXEC_TIMEOUT}s"
 
+    # The exec output is captured as well as shown, because the artefacts are
+    # inside it. Downloading them afterwards does not work -- the session is
+    # unreachable by then -- so stdout is the retrieval channel and it has to
+    # be kept. PIPESTATUS, because `tee` would otherwise mask the exit code.
+    # Tested by `if` rather than run bare, because this script sets errexit and
+    # a bare failing pipeline would abort here -- before PIPESTATUS is read and
+    # before the decode below, i.e. exactly on the failures the decode exists
+    # to survive. Commands tested by `if` are exempt, and PIPESTATUS is still
+    # the pipeline's when read in the else branch.
     rc=0
-    colab_cmd exec -s "$SESSION" -f "$remote_script" --timeout "$EXEC_TIMEOUT" || rc=$?
+    segment_out="${TMPDIR_RUN}/segment-${segment}.out"
+    if colab_cmd exec -s "$SESSION" -f "$remote_script" \
+           --timeout "$EXEC_TIMEOUT" 2>&1 | tee "$segment_out"; then
+        rc=0
+    else
+        rc="${PIPESTATUS[0]}"
+    fi
+
+    # Before anything else looks at the session: whatever the bootstrap framed
+    # into stdout is already on this machine and cannot be lost from here.
+    decode_artifacts "$segment_out" "$segment"
 
     # Whether `colab exec` propagates the script's exit code is not documented
     # (only `colab run` promises it), so the exec status is treated as a hint
