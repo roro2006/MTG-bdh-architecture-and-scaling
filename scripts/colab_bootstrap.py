@@ -46,6 +46,8 @@ returns long before the work does.
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
 import json
 import os
 import shutil
@@ -500,6 +502,78 @@ def _stream(argv: list[str], cwd: Path) -> int:
 # --------------------------------------------------------------------------
 # Artefacts
 # --------------------------------------------------------------------------
+#
+# Downloading artefacts off the VM afterwards does not work, and the reason is
+# structural rather than flaky. The VM stops being reachable at or just after
+# this script exits: `colab exec` returns, and the next call reports the
+# session 404/401. By the time the driver asks for a file there is nothing to
+# ask. Measured twice on runs that had completed and written everything --
+# retrieval got zero files, by any name, including a retry pass.
+#
+# stdout is the one channel that survives, because `colab exec` has already
+# streamed it to the driver by then. So artefacts are written to the run
+# directory as before *and* framed into stdout, base64-encoded, with a byte
+# count and a SHA-256 per file so the driver can tell a whole block from a
+# truncated or interleaved one. A block that fails its hash is dropped rather
+# than written, because a corrupt params.msgpack that looks fine is worse than
+# no params.msgpack at all.
+#
+# It costs log size -- about 1.4MB of base64 for a d=64 params.msgpack. That is
+# the price of a channel that works, and --emit-max-bytes stops a pathological
+# file (a 4MB resume.msgpack) dominating the stream.
+
+ARTIFACT_BEGIN = "===MTG-ARTEFACT-BEGIN"
+ARTIFACT_END = "===MTG-ARTEFACT-END"
+DEFAULT_EMIT_MAX_BYTES = 4_000_000
+
+# Ordered by value per byte, so a stream cut short still delivers what matters
+# most: metrics.json is the result, params.msgpack is the model, and resume
+# state is worth least once a run has finished.
+EMIT_PRIORITY = (
+    "STATUS.json",
+    "metrics.json",
+    "metadata.json",
+    "progress.json",
+    "params.msgpack",
+)
+
+
+def emit_artifacts(
+    directory: Path,
+    max_bytes: int = DEFAULT_EMIT_MAX_BYTES,
+    names: tuple[str, ...] = EMIT_PRIORITY,
+) -> list[str]:
+    """Frames each artefact into stdout as base64. Returns what it emitted.
+
+    Line-oriented and self-describing on purpose, so the driver can recover
+    files from a log it merely happened to capture:
+
+        ===MTG-ARTEFACT-BEGIN <name> <bytes> <sha256>
+        <base64, 76 columns>
+        ===MTG-ARTEFACT-END <name>
+    """
+    emitted: list[str] = []
+    for name in names:
+        path = directory / name
+        if not path.is_file():
+            continue
+        raw = path.read_bytes()
+        if len(raw) > max_bytes:
+            print(
+                f"[emit] skipping {name}: {len(raw):,}B exceeds the "
+                f"{max_bytes:,}B cap",
+                flush=True,
+            )
+            continue
+        digest = hashlib.sha256(raw).hexdigest()
+        encoded = base64.b64encode(raw).decode("ascii")
+        print(f"{ARTIFACT_BEGIN} {name} {len(raw)} {digest}", flush=True)
+        for start in range(0, len(encoded), 76):
+            print(encoded[start : start + 76])
+        print(f"{ARTIFACT_END} {name}", flush=True)
+        emitted.append(name)
+    print(f"[emit] {len(emitted)} artefact(s) into stdout: {emitted}", flush=True)
+    return emitted
 
 
 def mirror_artefacts(
@@ -590,6 +664,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="optional processed-data cache, e.g. a mounted "
                              "/content/drive/MyDrive/mtg-cache. Off by default; "
                              "see the note above stage_set().")
+    parser.add_argument("--emit-artifacts", action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help="frame the run's artefacts into stdout as base64 "
+                             "so they survive the VM becoming unreachable at "
+                             "teardown. On by default: it is the only "
+                             "retrieval path measured to work.")
+    parser.add_argument("--emit-max-bytes", type=int,
+                        default=DEFAULT_EMIT_MAX_BYTES,
+                        help="skip emitting any artefact larger than this "
+                             "(default %(default)s)")
     parser.add_argument("--mirror-resume", action="store_true",
                         help="also copy the resume state into the artefact dir")
     parser.add_argument("--allow-cpu", action="store_true",
@@ -789,6 +873,12 @@ def main(argv: list[str] | None = None) -> int:
     print(f"\n[artefacts] {len(files)} file(s) in {artefact_dir}", flush=True)
     for name in files:
         print(f"    {name}", flush=True)
+
+    # Last, and deliberately after STATUS.json exists so it travels too. This
+    # is the only retrieval path that survives the VM becoming unreachable at
+    # teardown; see the note above emit_artifacts.
+    if args.emit_artifacts:
+        emit_artifacts(artefact_dir, max_bytes=args.emit_max_bytes)
 
     if code == EXIT_INCOMPLETE:
         print(

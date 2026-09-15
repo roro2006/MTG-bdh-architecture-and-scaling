@@ -564,6 +564,32 @@ ARTEFACT_NAMES=(
     resume.msgpack
 )
 
+readonly DECODER="${REPO_ROOT}/scripts/decode_artifacts.py"
+
+# Recover artefacts from the exec output the bootstrap framed them into.
+#
+# This is the retrieval path that works. Downloading afterwards does not: the
+# VM stops being reachable at teardown, and two completed runs lost everything
+# that way -- zero files recovered, by any name, retries included. stdout has
+# already reached this machine by the time the session dies.
+#
+# Called after every exec, before anything consults the session, and safe to
+# repeat: the decoder verifies a SHA-256 per file and will not overwrite a good
+# file with a worse one.
+decode_artifacts() {
+    local capture="$1"
+    [[ -s "$capture" ]] || return 0
+    [[ -f "$DECODER" ]] || { warn "missing ${DECODER}"; return 0; }
+
+    local out
+    if out="$(python3 "$DECODER" "$capture" "$LOCAL_ARTIFACTS" 2>&1)"; then
+        [[ -n "$out" ]] && printf '[driver] %s\n' "$out" >&2
+    else
+        warn "artefact decoding reported problems:"
+        printf '[driver]   %s\n' "$out" >&2
+    fi
+}
+
 # Returns 0 if a STATUS.json came back. The bootstrap writes it last, so its
 # absence *usually* means the segment died before finishing -- but not always,
 # and that distinction cost two complete runs. Twice the bootstrap finished,
@@ -587,6 +613,19 @@ fetch_status() {
         fi
         [[ "$attempt" -lt 3 ]] && sleep $(( attempt * 3 ))
     done
+
+    # The download failed -- which, at teardown, it always will. But
+    # decode_artifacts may already have recovered STATUS.json out of the exec
+    # output, and a copy that arrived by stdout is exactly as authoritative as
+    # one that arrived by download.
+    local decoded="${LOCAL_ARTIFACTS}/STATUS.json"
+    if [[ -s "$decoded" ]] \
+       && python3 -c 'import json,sys; json.load(open(sys.argv[1]))' \
+              "$decoded" 2>/dev/null; then
+        cp -f "$decoded" "$STATUS_LOCAL"
+        log "STATUS.json recovered from the exec output rather than downloaded"
+        return 0
+    fi
     return 1
 }
 
@@ -774,8 +813,19 @@ while (( segment < MAX_SEGMENTS )); do
 
     log "segment ${segment}/${MAX_SEGMENTS}$([[ "$resume" == "1" ]] && printf ' (resuming)') -- exec timeout ${EXEC_TIMEOUT}s"
 
+    # The exec output is captured as well as shown, because the artefacts are
+    # inside it. Downloading them afterwards does not work -- the session is
+    # unreachable by then -- so stdout is the retrieval channel and it has to
+    # be kept. PIPESTATUS, because `tee` would otherwise mask the exit code.
     rc=0
-    colab_cmd exec -s "$SESSION" -f "$remote_script" --timeout "$EXEC_TIMEOUT" || rc=$?
+    segment_out="${TMPDIR_RUN}/segment-${segment}.out"
+    colab_cmd exec -s "$SESSION" -f "$remote_script" --timeout "$EXEC_TIMEOUT" \
+        2>&1 | tee "$segment_out"
+    rc="${PIPESTATUS[0]}"
+
+    # Before anything else looks at the session: whatever the bootstrap framed
+    # into stdout is already on this machine and cannot be lost from here.
+    decode_artifacts "$segment_out"
 
     # Whether `colab exec` propagates the script's exit code is not documented
     # (only `colab run` promises it), so the exec status is treated as a hint

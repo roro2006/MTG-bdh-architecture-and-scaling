@@ -500,3 +500,187 @@ def test_completion_is_judged_on_completed_not_on_the_file_existing():
     assert '"completed"' in body, (
         "metrics_says_complete treats any metrics.json as a finished run"
     )
+
+
+# --------------------------------------------------------------------------
+# Artefacts travel through stdout
+# --------------------------------------------------------------------------
+#
+# The download path does not work and cannot be made to: the VM stops being
+# reachable at teardown, and two completed runs lost everything that way --
+# zero files, by any name, retries included. stdout survives, because `colab
+# exec` has already streamed it.
+#
+# Unlike the structural assertions above, these exercise both halves for real:
+# emit into a captured stdout, decode it back, compare bytes. A previous
+# attempt at this fix passed its tests and still recovered nothing on a live
+# run, which is what a round trip would have caught.
+
+import importlib.util
+import io
+import json
+import os
+from contextlib import redirect_stdout
+
+
+def _decoder():
+    spec = importlib.util.spec_from_file_location(
+        "decode_artifacts", SCRIPTS / "decode_artifacts.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _emit_to_string(directory, **kwargs) -> str:
+    module = _load_bootstrap_without_running_it()
+    buffer = io.StringIO()
+    with redirect_stdout(buffer):
+        module["emit_artifacts"](directory, **kwargs)
+    return buffer.getvalue()
+
+
+@pytest.fixture
+def artefacts(tmp_path):
+    """A run directory holding the shapes the real one does."""
+    d = tmp_path / "run"
+    d.mkdir()
+    (d / "STATUS.json").write_text(json.dumps({"completed": True, "files": ["a"]}))
+    (d / "metrics.json").write_text(json.dumps({"completed": True, "history": [1] * 500}))
+    # Binary, incompressible, and not a multiple of 3 bytes so base64 pads.
+    (d / "params.msgpack").write_bytes(os.urandom(100_003))
+    return d
+
+
+def test_artefacts_survive_a_round_trip_through_stdout(artefacts, tmp_path):
+    """The property the whole fix rests on, end to end."""
+    captured = _emit_to_string(artefacts)
+    dest = tmp_path / "recovered"
+
+    written, failed = _decoder().decode(captured, dest)
+
+    assert not failed, failed
+    for name in ("STATUS.json", "metrics.json", "params.msgpack"):
+        assert (dest / name).read_bytes() == (artefacts / name).read_bytes(), (
+            f"{name} did not survive the round trip byte-for-byte"
+        )
+    assert len(written) == 3
+
+
+def test_training_output_around_the_blocks_is_ignored(artefacts, tmp_path):
+    """The real stream is mostly step lines, and `tee` decorates nothing.
+
+    A decoder that only works on a pristine capture would work in a test and
+    fail on a log.
+    """
+    captured = _emit_to_string(artefacts)
+    noisy = "\n".join([
+        "  step 91,750  train 0.9173  val 1.3356  val_acc 0.5121  (2,521s)",
+        captured,
+        "An exception has occurred, use %tb to see the full traceback.",
+        "SystemExit: 0",
+    ])
+
+    written, failed = _decoder().decode(noisy, tmp_path / "recovered")
+    assert not failed, failed
+    assert len(written) == 3
+
+
+def test_a_truncated_stream_loses_only_the_cut_block(artefacts, tmp_path):
+    """A lost session cuts the stream mid-file.
+
+    The files already closed must still be recovered -- that is the whole
+    point of framing per file rather than emitting one archive.
+    """
+    captured = _emit_to_string(artefacts)
+    cut = captured[: int(len(captured) * 0.8)]
+
+    dest = tmp_path / "recovered"
+    written, failed = _decoder().decode(cut, dest)
+
+    # STATUS.json and metrics.json are emitted before params.msgpack, so they
+    # close before any plausible cut.
+    assert (dest / "STATUS.json").read_bytes() == (artefacts / "STATUS.json").read_bytes()
+    assert (dest / "metrics.json").read_bytes() == (artefacts / "metrics.json").read_bytes()
+    assert not (dest / "params.msgpack").exists(), (
+        "a half-written params.msgpack was created from a truncated block"
+    )
+
+
+def test_a_corrupted_block_is_refused_not_written(artefacts, tmp_path):
+    """A corrupt params.msgpack that looks real is worse than none."""
+    captured = _emit_to_string(artefacts)
+    lines = captured.splitlines()
+
+    # Corrupt a line inside params.msgpack's block specifically -- several
+    # blocks have 76-column lines, and flipping "the first long line" hits
+    # metrics.json instead, which is how this test first passed vacuously.
+    start = next(
+        i for i, line in enumerate(lines)
+        if line.startswith("===MTG-ARTEFACT-BEGIN params.msgpack")
+    )
+    lines[start + 5] = "A" * len(lines[start + 5])
+    corrupted = "\n".join(lines)
+
+    dest = tmp_path / "recovered"
+    written, failed = _decoder().decode(corrupted, dest)
+
+    assert any("params.msgpack" in f for f in failed), failed
+    assert not (dest / "params.msgpack").exists(), (
+        "a corrupted artefact was written anyway"
+    )
+    # The intact blocks are unaffected: one bad file must not cost the rest.
+    assert (dest / "metrics.json").read_bytes() == (artefacts / "metrics.json").read_bytes()
+
+
+def test_decoding_twice_is_safe(artefacts, tmp_path):
+    """Segments get decoded from the live capture and again from the log."""
+    captured = _emit_to_string(artefacts)
+    dest = tmp_path / "recovered"
+
+    _decoder().decode(captured, dest)
+    before = (dest / "params.msgpack").read_bytes()
+    written, failed = _decoder().decode(captured, dest)
+
+    assert not failed
+    assert (dest / "params.msgpack").read_bytes() == before
+    assert any("already present" in w for w in written)
+
+
+def test_oversized_artefacts_are_skipped_loudly(artefacts, tmp_path):
+    captured = _emit_to_string(artefacts, max_bytes=1000)
+    assert "skipping params.msgpack" in captured
+
+    written, failed = _decoder().decode(captured, tmp_path / "recovered")
+    assert not failed
+    assert not any("params.msgpack" in w for w in written)
+
+
+def test_the_driver_decodes_before_it_consults_the_session():
+    """Ordering is the property: the session may already be gone."""
+    source = DRIVER.read_text(encoding="utf-8")
+    assert "decode_artifacts" in source, "the driver never decodes the exec output"
+    assert 'tee "$segment_out"' in source, "the driver does not capture exec output"
+    assert "PIPESTATUS" in source, "tee would mask the exec exit code"
+
+    body = source[source.index("colab_cmd exec -s"):]
+    assert body.index("decode_artifacts") < body.index("if fetch_status"), (
+        "the driver consults the session before decoding what it already has"
+    )
+
+
+def test_emit_is_on_by_default_and_ordered_by_value():
+    module = _load_bootstrap_without_running_it()
+    args = module["parse_args"](["--sets", "FIN", "--train-set", "FIN"])
+    assert args.emit_artifacts is True, (
+        "emitting is the only retrieval path that works; it cannot be opt-in"
+    )
+    off = module["parse_args"](
+        ["--sets", "FIN", "--train-set", "FIN", "--no-emit-artifacts"]
+    )
+    assert off.emit_artifacts is False
+
+    priority = list(module["EMIT_PRIORITY"])
+    assert priority.index("metrics.json") < priority.index("params.msgpack"), (
+        "a truncated stream should deliver the result before the weights"
+    )
