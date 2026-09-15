@@ -97,6 +97,17 @@ def decode(text: str, dest: Path) -> tuple[list[str], list[str]]:
             failed.append(f"{name}: sha256 {got[:12]} != {want[:12]}")
             continue
 
+        # The name comes out of a raw stdout capture, so it is untrusted input
+        # even though the payload is hash-checked -- whoever writes the marker
+        # line controls the digest too, so the hash proves nothing about where
+        # the file should go. `Path("/dest") / "/etc/passwd"` is `/etc/passwd`,
+        # and `..` is not normalised away, so an unvalidated name is an
+        # arbitrary write (and, through the "already present" read below, an
+        # arbitrary read). Only bare filenames are accepted.
+        if name != Path(name).name or name in ("", ".", ".."):
+            failed.append(f"{name!r}: not a bare filename, refusing to write it")
+            continue
+
         target = dest / name
         if target.is_file() and hashlib.sha256(target.read_bytes()).hexdigest() == want:
             written.append(f"{name} (already present, identical)")

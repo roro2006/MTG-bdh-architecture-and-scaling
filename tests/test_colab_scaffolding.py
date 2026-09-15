@@ -516,6 +516,8 @@ def test_completion_is_judged_on_completed_not_on_the_file_existing():
 # attempt at this fix passed its tests and still recovered nothing on a live
 # run, which is what a round trip would have caught.
 
+import base64
+import hashlib
 import importlib.util
 import io
 import json
@@ -684,3 +686,138 @@ def test_emit_is_on_by_default_and_ordered_by_value():
     assert priority.index("metrics.json") < priority.index("params.msgpack"), (
         "a truncated stream should deliver the result before the weights"
     )
+
+
+# --------------------------------------------------------------------------
+# Four bugs found in review of the stdout-retrieval change
+# --------------------------------------------------------------------------
+#
+# All four were real, and two of them disabled the retrieval path on exactly
+# the failures it exists to survive. They are regression-tested here because
+# three are control-flow properties of a shell script that no Python test
+# would otherwise touch.
+
+
+def _run_snippet(tmp_path, body: str):
+    """Run a shell snippet under the driver's own `set -euo pipefail`."""
+    script = tmp_path / "snippet.sh"
+    script.write_text("set -euo pipefail\n" + body)
+    return subprocess.run(
+        ["bash", str(script)], capture_output=True, text=True
+    )
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash not available")
+def test_a_failing_exec_does_not_abort_before_the_decode(tmp_path):
+    """The driver must survive a failing exec long enough to decode.
+
+    A bare `cmd | tee f` under errexit aborts the script on failure, before
+    PIPESTATUS is read and before decode_artifacts runs -- killing recovery
+    precisely when the segment failed. Guarding with `if` exempts it.
+    """
+    guarded = _run_snippet(tmp_path, """
+run() { return 7; }
+rc=0
+if run 2>&1 | tee /dev/null; then rc=0; else rc="${PIPESTATUS[0]}"; fi
+echo "decoded rc=$rc"
+""")
+    assert guarded.returncode == 0, guarded.stderr
+    assert "decoded rc=7" in guarded.stdout, (
+        "the guarded form lost the pipeline's exit code"
+    )
+
+    # And the unguarded form really does abort -- otherwise this test is empty.
+    bare = _run_snippet(tmp_path, """
+run() { return 7; }
+rc=0
+run 2>&1 | tee /dev/null
+rc="${PIPESTATUS[0]}"
+echo "decoded rc=$rc"
+""")
+    assert bare.returncode != 0 and "decoded" not in bare.stdout, (
+        "a bare failing pipeline no longer aborts, so this guard is moot"
+    )
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash not available")
+def test_decode_artifacts_survives_producing_no_output(tmp_path):
+    """A segment that died before emitting is normal, not fatal.
+
+    `[[ -n "$out" ]] && printf ...` as a function's last statement returns 1
+    when there is nothing to print, and the call site is a bare statement
+    under errexit -- so an empty capture took the whole driver down.
+    """
+    ok = _run_snippet(tmp_path, """
+f() {
+    local out status=0
+    out="$(true)" || status=$?
+    if [[ -n "$out" ]]; then printf '%s\n' "$out"; fi
+    return 0
+}
+f
+echo "caller survived"
+""")
+    assert ok.returncode == 0 and "caller survived" in ok.stdout, ok.stderr
+
+    bad = _run_snippet(tmp_path, """
+f() {
+    local out
+    if out="$(true)"; then
+        [[ -n "$out" ]] && printf '%s\n' "$out"
+    fi
+}
+f
+echo "caller survived"
+""")
+    assert bad.returncode != 0, (
+        "the old form no longer kills the caller, so this guard is moot"
+    )
+
+
+def test_the_driver_reads_status_from_this_segment_only():
+    """A stale STATUS.json must not be read as the current segment's.
+
+    LOCAL_ARTIFACTS is deterministic and persists across segments and across
+    re-invocations, so a run whose segment died early could otherwise inherit
+    an earlier run's `completed: true` and stop having done no work.
+    """
+    body = _driver_function("fetch_status")
+    assert "DECODED_DIR" in body, (
+        "fetch_status falls back to a path that survives between runs"
+    )
+    assert "${LOCAL_ARTIFACTS}/STATUS.json" not in body, (
+        "fetch_status still trusts the persistent artefact directory"
+    )
+    decode = _driver_function("decode_artifacts")
+    assert "rm -rf" in decode and "DECODED_DIR" in decode, (
+        "the staging directory is not cleared per segment, so it can go stale too"
+    )
+
+
+def test_a_crafted_artefact_name_cannot_escape_the_destination(tmp_path):
+    """The name is untrusted input; the hash does not vouch for it.
+
+    The decoder reads a raw stdout capture, and whoever writes a marker line
+    controls its digest too -- so the SHA-256 check says nothing about where
+    the bytes belong. `Path(dest) / "/etc/passwd"` discards dest entirely.
+    """
+    module = _decoder()
+    payload = b"payload"
+    digest = hashlib.sha256(payload).hexdigest()
+    encoded = base64.b64encode(payload).decode()
+    outside = tmp_path / "outside.txt"
+
+    for name in (str(outside), "../escaped.txt", "sub/dir.txt"):
+        stream = (
+            f"===MTG-ARTEFACT-BEGIN {name} {len(payload)} {digest}\n"
+            f"{encoded}\n"
+            f"===MTG-ARTEFACT-END {name}\n"
+        )
+        dest = tmp_path / "dest"
+        written, failed = module.decode(stream, dest)
+
+        assert not written, f"{name!r} was written"
+        assert any("bare filename" in f for f in failed), failed
+
+    assert not outside.exists(), "the decoder wrote outside its destination"
+    assert not (tmp_path / "escaped.txt").exists()
